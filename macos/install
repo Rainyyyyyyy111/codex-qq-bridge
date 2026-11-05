@@ -1,0 +1,36 @@
+#!/bin/zsh
+set -eu
+umask 077
+code=${0:A:h}
+if [[ -z ${QQ_BRIDGE_PROFILE:-} ]]; then exec "$code/bridge" install "$@"; fi
+state=$QQ_BRIDGE_STATE
+runtime=$QQ_BRIDGE_RUNTIME
+label=$QQ_BRIDGE_LABEL
+plist="$HOME/Library/LaunchAgents/$label.plist"
+domain="gui/$(id -u)"
+nodebin=$(command -v node)
+command -v codex >/dev/null
+# Validate private configuration before copying files or touching launchd.
+"$nodebin" "$code/settings.cjs" "$state" "$QQ_BRIDGE_PROFILE"
+mkdir -p "$runtime" "$state" "${plist:h}"
+print -r -- "$QQ_BRIDGE_PROFILE" > "$runtime/installed-profile.new.$$"
+mv "$runtime/installed-profile.new.$$" "$runtime/installed-profile"
+for file in bridge settings.cjs direct.cjs native.cjs host.c Info.plist run worker.sb worker.cjs group.cjs events.cjs ipc.cjs mcp.cjs trigger.py triggerctl.py dispatcher.md; do
+  if [[ "$code" != "$runtime" ]]; then cp "$code/$file" "$runtime/$file.new.$$"; mv "$runtime/$file.new.$$" "$runtime/$file"; fi
+done
+chmod 700 "$runtime/run" "$runtime/bridge"
+"$runtime/run" probe
+/usr/bin/python3 - "$plist" "$runtime" "$state" "$label" "$QQ_BRIDGE_PROFILE" <<'PY'
+from pathlib import Path
+import plistlib,sys
+plist,runtime,state,label,profile=sys.argv[1:]
+config=dict(Label=label,ProgramArguments=[str(Path(runtime)/'bridge'),'--profile',profile,'serve'],RunAtLoad=True,
+            KeepAlive=dict(SuccessfulExit=False),ThrottleInterval=10,ProcessType='Background',
+            StandardOutPath=str(Path(state)/'kernel.log'),StandardErrorPath=str(Path(state)/'kernel.log'))
+tmp=Path(plist+'.new');tmp.write_bytes(plistlib.dumps(config));tmp.replace(plist)
+PY
+if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
+  /bin/launchctl bootout "$domain/$label"
+fi
+/bin/launchctl bootstrap "$domain" "$plist"
+codex mcp add "$QQ_BRIDGE_SERVER" -- /usr/bin/env "QQ_BRIDGE_NODE=$nodebin" "$runtime/bridge" --profile "$QQ_BRIDGE_PROFILE" mcp

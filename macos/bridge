@@ -1,0 +1,43 @@
+#!/bin/zsh
+set -eu
+umask 077
+code=${0:A:h}
+installed=""
+[[ ! -f "$code/installed-profile" ]] || installed=$(<"$code/installed-profile")
+profile=${installed:-default}
+if [[ ${1:-} == --profile ]]; then
+  profile=${2:?Missing profile name}
+  shift 2
+fi
+if [[ -n "$installed" && "$installed" != "$profile" ]]; then
+  print -u2 "This runtime is installed for profile $installed"
+  exit 2
+fi
+export LC_ALL=C
+if [[ ! $profile =~ '^[a-z][a-z0-9-]{0,23}$' ]]; then
+  print -u2 'Profile must be 1–24 lowercase ASCII letters, digits or hyphens, starting with a letter'
+  exit 2
+fi
+suffix=""
+route=mac
+if [[ $profile != default ]]; then
+  suffix="-$profile"
+  route="acct-$profile"
+fi
+export QQ_BRIDGE_STATE="$HOME/Library/Application Support/CodexQQBridge$suffix"
+export QQ_BRIDGE_RUNTIME="$HOME/Library/Application Support/CodexQQBridgeRuntime$suffix"
+export QQ_BRIDGE_SERVER="qq-bridge$suffix"
+export QQ_BRIDGE_LABEL="local.codex.qq-bridge$suffix"
+export QQ_BRIDGE_PROFILE="$profile" QQ_BRIDGE_ROUTE="$route"
+action=${1:-help}
+(( $# == 0 )) || shift
+case "$action" in
+  paths) print -rl -- "$QQ_BRIDGE_STATE" "$QQ_BRIDGE_RUNTIME" "$QQ_BRIDGE_LABEL" "$QQ_BRIDGE_SERVER" "$route" ;;
+  install) exec "$code/install" "$@" ;;
+  probe|serve|choose) exec "$code/run" "$action" "$@" ;;
+  status) exec "${QQ_BRIDGE_NODE:-node}" "$code/mcp.cjs" --status ;;
+  mcp) exec "${QQ_BRIDGE_NODE:-node}" "$code/mcp.cjs" ;;
+  trigger) exec /usr/bin/python3 "$code/triggerctl.py" "$@" ;;
+  *) print -u2 'Usage: ./bridge [--profile NAME] paths|probe|install|status|mcp|serve|choose GROUP|trigger ACTION'
+     exit 2 ;;
+esac

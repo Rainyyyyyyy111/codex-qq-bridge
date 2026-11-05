@@ -1,0 +1,27 @@
+#!/bin/zsh
+set -eu
+umask 077
+ulimit -c 0
+code=${0:A:h}
+if [[ -f "$code/installed-profile" && -z ${QQ_BRIDGE_PROFILE:-} ]]; then
+  if (( $# == 0 )); then set -- serve; fi
+  exec "$code/bridge" "$@"
+fi
+state="${QQ_BRIDGE_STATE:-$HOME/Library/Application Support/CodexQQBridge}"
+bundle="$state/Bridge.app/Contents"
+qq=/Applications/QQ.app/Contents
+mkdir -p "$state"/{home,tmp,data} "$bundle"/{MacOS,Frameworks,Resources}
+if [[ ! -x "$bundle/MacOS/bridge" || "$code/host.c" -nt "$bundle/MacOS/bridge" ]]; then
+  /usr/bin/clang -Wall -Wextra -O2 "$code/host.c" -o "$bundle/MacOS/bridge.$$"
+  mv "$bundle/MacOS/bridge.$$" "$bundle/MacOS/bridge"
+fi
+cp "$code/Info.plist" "$bundle/Info.plist"
+for framework in 'Electron Framework' 'QQNT'; do
+  [[ -e "$bundle/Frameworks/$framework.framework" ]] || ln -s "$qq/Frameworks/QQNT.framework" "$bundle/Frameworks/$framework.framework"
+done
+cd "$state"
+if [[ "${1:-serve}" == serve && -f needs-selection.json && ! -f binding.json ]]; then
+  echo 'Group name ambiguous; operator selection required' >&2
+  exit 0
+fi
+exec /usr/bin/env -i PATH=/usr/bin:/bin HOME="$state/home" CFFIXED_USER_HOME="$state/home" TMPDIR="$state/tmp/" LANG=en_US.UTF-8 QQ_STATE="$state" QQ_BRIDGE_PROFILE="${QQ_BRIDGE_PROFILE:-default}" /usr/bin/sandbox-exec -D "STATE=$state" -D "REALHOME=$HOME" -D "CODE=$code" -f "$code/worker.sb" "$bundle/MacOS/bridge" "$code/worker.cjs" "$@"

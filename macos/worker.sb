@@ -1,0 +1,6 @@
+(version 1)
+(allow default)
+(deny file-read-data (subpath (param "REALHOME")))
+(allow file-read-data (subpath (param "CODE")) (subpath (param "STATE")))
+(deny file-write*)
+(allow file-write* (subpath (param "STATE")) (literal "/dev/null") (literal "/dev/tty"))
