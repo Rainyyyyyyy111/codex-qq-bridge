@@ -1,0 +1,25 @@
+name: Paired QQ collaboration
+on:
+  push:
+    paths: ['collaboration/**', 'windows/**', 'macos/**', '.github/workflows/collaboration.yml']
+  pull_request:
+    paths: ['collaboration/**', 'windows/**', 'macos/**', '.github/workflows/collaboration.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paired-workflow:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Test collaboration and native adapters with synthetic QQ and model responses
+        run: node --test "./collaboration/*.test.cjs" "./windows/*.test.cjs" "./macos/*.test.cjs"

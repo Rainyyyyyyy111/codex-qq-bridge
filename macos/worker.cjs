@@ -41,12 +41,14 @@ let qrFile,
   loggedIn = false,
   loginStarted = false,
   querying = false;
+let paired;
 function removeQR() {
   if (qrFile) fs.rmSync(qrFile, { force: true });
   qrFile = undefined;
 }
 function stop(msg) {
   console.error(msg);
+  paired?.stop();
   removeQR();
   fs.rmSync('bridge.sock', { force: true });
   // Native background threads can still be active during Node atexit handlers.
@@ -77,10 +79,9 @@ function validId(id) {
   return typeof id === 'string' && /^[1-9]\d*$/.test(id);
 }
 // Only an explicit local operator command can disambiguate a name.
-if (process.argv[2] === 'choose') {
+function chooseGroup(id) {
   const pending = readJSON('needs-selection.json'),
     account = readJSON('account.json');
-  const id = process.argv[3];
   if (
     !pending ||
     pending.name !== target ||
@@ -93,9 +94,13 @@ if (process.argv[2] === 'choose') {
   const existing = readJSON('binding.json');
   if (existing && (existing.id !== id || existing.uid !== pending.uid))
     throw Error('A different binding already exists');
-  writeJSON('binding.json', { name: target, id, uid: pending.uid, uin: pending.uin });
+  const chosen = { name: target, id, uid: pending.uid, uin: pending.uin };
+  writeJSON('binding.json', chosen);
   fs.rmSync('needs-selection.json');
-  console.log('Selected ' + id);
+  return chosen;
+}
+if (process.argv[2] === 'choose') {
+  console.log('Selected ' + chooseGroup(process.argv[3]).id);
   process.exit(0);
 }
 for (const filename of fs.readdirSync(root)) {
@@ -105,8 +110,18 @@ let binding, direct;
 let group,
   ready = false,
   phase = 'connecting';
-require('./ipc.cjs').listen(async (name, args, alive) => {
+require('./ipc.cjs').listen(async (name, args, alive, signal) => {
   if (name === 'status') return { phase, qrFile, ready, watch: group?.status() };
+  if (name === 'choose_group') {
+    if (!paired || phase !== 'group selection required; paired DM active') throw Error('No pending group choice');
+    binding=chooseGroup(args.id);
+    void startRead().catch(e=>stop(e.message));
+    return {selected:binding.id};
+  }
+  if (['collab_info','collab_send','collab_wait','dm_latest','dm_send'].includes(name)) {
+    if (!paired) throw Error('Collaboration not configured or native session not ready');
+    return paired.call(name,args,signal);
+  }
   if (!ready) throw Error('QQ ' + phase + (qrFile ? ' — 请扫码 ' + qrFile : ''));
   if (name === 'read_dm_latest' || name === 'send_dm_text') {
     if (!direct) throw Error('Direct contacts are disabled for this profile');
@@ -174,8 +189,10 @@ function selectGroup({ uin, uid }) {
   const g = session.getGroupService();
   let selected = false;
   setTimeout(() => {
-    if (!selected)
-      stop('getGroupList: no complete directory matched the exact group name within 60 s');
+    if (!selected) {
+      if (paired) phase = 'waiting for group directory; paired DM active';
+      else stop('getGroupList: no complete directory matched the exact group name within 60 s');
+    }
   }, 60000);
   function onList(list) {
     if (selected || !Array.isArray(list) || !list.length) return;
@@ -187,6 +204,7 @@ function selectGroup({ uin, uid }) {
     if (matched.length > 1) {
       selected = true;
       writeJSON('needs-selection.json', { name: target, ids: matched, uid, uin });
+      if (paired) { phase = 'group selection required; paired DM active'; return; }
       return stop('Ambiguous exact matches, choose a group code: ' + matched.join(', '));
     }
     selected = true;
@@ -227,7 +245,7 @@ function startSession({ uin, uid }) {
     .getMachineGuid()
     .replace(/^(\w{8})(\w{4})(\w{4})(\w{4})(\w{12})$/, '$1-$2-$3-$4-$5');
   setTimeout(() => {
-    if (!ready) stop('Session initialization timed out');
+    if (!ready && !paired) stop('Session initialization timed out');
   }, 120000);
   session.init(
     {
@@ -277,7 +295,16 @@ function startSession({ uin, uid }) {
     callbacks({
       onOpentelemetryInit(info) {
         console.log('onOpentelemetryInit', info?.is_init);
-        if (info?.is_init) setImmediate(() => selectGroup({ uin, uid }));
+        if (info?.is_init) setImmediate(() => {
+          if (!paired && settings.collaborationContact) {
+            fs.mkdirSync(path.join(root,'dm-outbox'),{recursive:true,mode:0o700});
+            paired = require('./paired-dm.cjs').createPairedDM({root,self:{uin:String(uin),uid},settings,
+              currentSettings:()=>loadSettings(root,profile),session,callbacks,readJSON,writeJSON,
+              onDisconnect:()=>stop('Paired QQ session disconnected')});
+            void paired.start();
+          }
+          selectGroup({ uin, uid });
+        });
       },
     }),
   );

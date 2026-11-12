@@ -25,6 +25,7 @@ if [[ $profile != default ]]; then
   route="acct-$profile"
 fi
 export QQ_BRIDGE_STATE="$HOME/Library/Application Support/CodexQQBridge$suffix"
+export QQ_BRIDGE_COLLAB_STATE="$HOME/Library/Application Support/CodexQQCollaboration$suffix"
 export QQ_BRIDGE_RUNTIME="$HOME/Library/Application Support/CodexQQBridgeRuntime$suffix"
 export QQ_BRIDGE_SERVER="qq-bridge$suffix"
 export QQ_BRIDGE_LABEL="local.codex.qq-bridge$suffix"
@@ -34,10 +35,29 @@ action=${1:-help}
 case "$action" in
   paths) print -rl -- "$QQ_BRIDGE_STATE" "$QQ_BRIDGE_RUNTIME" "$QQ_BRIDGE_LABEL" "$QQ_BRIDGE_SERVER" "$route" ;;
   install) exec "$code/install" "$@" ;;
-  probe|serve|choose) exec "$code/run" "$action" "$@" ;;
+  probe|serve) exec "$code/run" "$action" "$@" ;;
+  choose)
+    if [[ -S "$QQ_BRIDGE_STATE/bridge.sock" ]]; then
+      rc=0
+      QQ_BRIDGE_CONNECT_ONLY=1 "${QQ_BRIDGE_NODE:-node}" "$code/mcp.cjs" --choose "$@" || rc=$?
+      if [[ "$rc" != 3 ]]; then exit "$rc"; fi
+    fi
+    exec "$code/run" choose "$@" ;;
   status) exec "${QQ_BRIDGE_NODE:-node}" "$code/mcp.cjs" --status ;;
   mcp) exec "${QQ_BRIDGE_NODE:-node}" "$code/mcp.cjs" ;;
+  collab)
+    if [[ ${1:-status} == paths ]]; then print -r -- "$QQ_BRIDGE_COLLAB_STATE"; exit 0; fi
+    if [[ ${1:-status} == pair ]]; then
+      shift
+      exec "${QQ_BRIDGE_NODE:-node}" "$code/settings.cjs" --pair "$QQ_BRIDGE_STATE" "$@"
+    fi
+    shared="$code/collaboration"
+    [[ -f "$shared/service.cjs" ]] || shared="$code/../collaboration"
+    [[ -f "$shared/service.cjs" ]] || { print -u2 'Install the repository with its collaboration directory'; exit 2; }
+    action=${1:-status}
+    (( $# == 0 )) || shift
+    exec "${QQ_BRIDGE_NODE:-node}" "$shared/service.cjs" "$action" --state "$QQ_BRIDGE_COLLAB_STATE" --bridge-dir "$QQ_BRIDGE_STATE" --socket bridge.sock "$@" ;;
   trigger) exec /usr/bin/python3 "$code/triggerctl.py" "$@" ;;
-  *) print -u2 'Usage: ./bridge [--profile NAME] paths|probe|install|status|mcp|serve|choose GROUP|trigger ACTION'
+  *) print -u2 'Usage: ./bridge [--profile NAME] paths|probe|install|status|mcp|serve|choose GROUP|trigger ACTION|collab ACTION'
      exit 2 ;;
 esac

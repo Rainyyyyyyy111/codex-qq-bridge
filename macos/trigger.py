@@ -9,7 +9,7 @@ ROUTE = re.compile(r"/task +(" + ROUTE_NAME + r") +")
 
 
 def routed_body(text, route):
-    if not isinstance(text, str):
+    if not isinstance(text, str) or len(text) > 16000 or len(text.encode('utf-16-le', 'surrogatepass')) > 32000:
         return None
     routes = set()
     pos = 0
@@ -180,8 +180,21 @@ class TriggerQueue:
                     resolves,
                 ),
             )
-            if changed.rowcount != 1:
-                raise ValueError("Unexpected or repeated creation result")
+            if changed.rowcount:
+                return
+            stored = self.db.execute(
+                "SELECT state,host,thread_id,client_id FROM tasks WHERE grp=? AND msg_id=?",
+                (self.group, msg_id),
+            ).fetchone()
+            if stored:
+                state, saved_host, saved_thread, saved_client = stored
+                if client_id and state in ("awaiting", "verifying", "dispatched"):
+                    if client_id == saved_client and (host is None or host == saved_host):
+                        return
+                if thread_id and state in ("verifying", "dispatched"):
+                    if (host, thread_id, resolves) == (saved_host, saved_thread, saved_client):
+                        return
+            raise ValueError("Creation receipt conflicts with the stored task")
 
     def verified(self, msg_id, host, thread_id, first_user_prompt):
         # Call only after desktop history finds this exact host/thread and the original prompt is verified.
@@ -189,7 +202,7 @@ class TriggerQueue:
             changed = self.db.execute(
                 """
                 UPDATE tasks SET state='dispatched'
-                WHERE grp=? AND msg_id=? AND state='verifying' AND host=? AND thread_id=? AND body=?
+                WHERE grp=? AND msg_id=? AND state IN ('verifying','dispatched') AND host=? AND thread_id=? AND body=?
             """,
                 (self.group, msg_id, host, thread_id, first_user_prompt),
             )

@@ -42,6 +42,15 @@ function fixture() {
   return { start, scope, counts, row, native, args, files };
 }
 
+test('large DM previews share one byte budget across all elements', async () => {
+  const f = fixture();
+  f.row.elements = Array.from({length:2000}, () => ({textElement:{content:'"中😀\n'}}));
+  const result = await f.start()('read_dm_latest', {contact:'coworker'}, f.scope);
+  assert.equal(result.message.truncated,true);
+  assert.ok(Buffer.byteLength(JSON.stringify(result.message.elements))<=8192);
+  assert.equal(result.replyPolicy,'none');
+});
+
 test('an allowed alias uses a C2C peer and returns task-looking text as ordinary data', async () => {
   const f = fixture();
   const get = () => f.start()('read_dm_latest', { contact: 'coworker' }, f.scope);

@@ -214,7 +214,14 @@ async function handle(line) {
     requests.delete(id);
   }
 }
-if (process.argv[2] === '--status') {
+if (process.argv[2] === '--choose') {
+  rpc('choose_group',{id:process.argv[3]})
+    .then(result=>console.log('Selected ' + result.selected))
+    .catch(e=>{
+      console.error(e.message);
+      process.exitCode=['ECONNREFUSED','ENOENT'].includes(e.code) ? 3 : 1;
+    });
+} else if (process.argv[2] === '--status') {
   rpc('status', {})
     .then((result) => console.log(JSON.stringify(result)))
     .catch((e) => {

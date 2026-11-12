@@ -1,0 +1,13 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';img-src 'self' file:;script-src 'unsafe-inline';style-src 'unsafe-inline'">
+<title>QQ 私聊协作登录</title>
+<style>body{max-width:34rem;margin:8vh auto;padding:1rem;font:18px/1.7 system-ui;text-align:center}img{max-width:280px;width:70vw;image-rendering:pixelated}</style>
+<h1>登录本机协作 QQ</h1><p>请用本机配对的 QQ 账号扫码，在手机上确认登录。</p>
+<img id="qr" hidden alt="本机 QQ 私聊登录二维码"><p id="status" role="status"></p>
+<script>
+const qr=document.getElementById('qr'),statusText=document.getElementById('status');
+function refresh(){const img=new Image();img.onload=()=>{qr.src=img.src;qr.hidden=false;statusText.textContent='二维码由本机 QQ 提供并自动刷新。';};
+img.onerror=()=>{qr.hidden=true;statusText.textContent='没有待扫描的二维码。可在本机运行 dm-status 查看状态。';};
+img.src='./dm-login.png?t='+Date.now();}refresh();setInterval(refresh,2000);
+</script></html>

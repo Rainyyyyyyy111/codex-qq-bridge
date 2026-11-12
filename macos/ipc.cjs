@@ -9,6 +9,8 @@ function listen(call) {
   fs.rmSync(socketName, { force: true });
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
+    const controller = new AbortController();
+    socket.once('close', () => controller.abort());
     let buffer = '',
       started = false;
     socket.on('error', () => socket.destroy());
@@ -20,7 +22,7 @@ function listen(call) {
       started = true;
       try {
         const { name, args } = JSON.parse(buffer.trim());
-        const value = await call(name, args, () => !socket.destroyed);
+        const value = await call(name, args, () => !socket.destroyed, controller.signal);
         if (!socket.destroyed) socket.end(JSON.stringify({ value }) + '\n');
       } catch (e) {
         if (!socket.destroyed) socket.end(JSON.stringify({ error: e.message }) + '\n');

@@ -7,7 +7,7 @@ const fmt = new Intl.DateTimeFormat('sv-SE', {
   dateStyle: 'short',
   timeStyle: 'medium',
 });
-const { checkedResult, checkArgs, validateText, textElement } = require('./native.cjs');
+const { checkedResult, checkArgs, validateText, textElement, previewMessage } = require('./native.cjs');
 function createGroup(session, binding, readJSON, writeJSON) {
   const msgs = session.getMsgService();
   const peer = { chatType: 2, peerUid: binding.id, guildId: '' };
@@ -166,7 +166,7 @@ function createGroup(session, binding, readJSON, writeJSON) {
           if (message.elements.some((e) => protocol.matchesClosedRound(e, closedRounds))) continue;
           return {
             message: {
-              ...message,
+              ...previewMessage(message),
               event: protocol.deliver(message.event, cursor.events ?? {}, Date.now()),
             },
           };
@@ -298,7 +298,8 @@ function createGroup(session, binding, readJSON, writeJSON) {
         if (!page.length) throw Error('Trigger history unavailable; cursor retained');
         result.rows = page.map(({ raw, m }) => {
           const e = raw.elements.length === 1 ? raw.elements[0] : null;
-          const plain = m.priority === 'owner' && e?.elementType === 1 && e.textElement?.atType === 0;
+          const plain = m.priority === 'owner' && e?.elementType === 1 && e.textElement?.atType === 0
+            && typeof e.textElement.content === 'string' && e.textElement.content.length <= 16000;
           return { chatType: 2, peerUid: binding.id, peerUin: binding.id, msgId: m.id, msgSeq: m.seq,
             senderUin: String(raw.senderUin), elements: plain ? [{ elementType: 1,
               textElement: { atType: 0, content: e.textElement.content } }] : [] };
@@ -307,7 +308,7 @@ function createGroup(session, binding, readJSON, writeJSON) {
       }
       if (name === 'read_latest') {
         checkArgs(args, []);
-        return { ...(await latestRecord()).m, replyPolicy: 'none' };
+        return { ...previewMessage((await latestRecord()).m), replyPolicy: 'none' };
       }
       if (name === 'wait_next') {
         checkArgs(args, ['timeout_ms']);

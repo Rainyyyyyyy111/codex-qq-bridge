@@ -1,24 +1,23 @@
 'use strict';
 const { createHash } = require('node:crypto');
-const { checkedResult, checkArgs, validateText, textElement } = require('./native.cjs');
+const { checkedResult, checkArgs, validateText, textElement, previewMessage } = require('./native.cjs');
 
 // A direct call always uses the authenticated account and a locally configured alias.
 // It has no dispatcher, background reader, or link to the group event state machine.
-function createDirect(session, self, settings, readJSON, writeJSON) {
+async function resolvePeer(session, self, uin) {
+  const mapping = await session.getProfileService().getUidByUin('FriendsServiceImpl', [uin]);
+  const uid = mapping.get(uin);
+  if (typeof uid !== 'string' || !/^u_[A-Za-z0-9_-]+$/.test(uid) || uid === self.uid)
+    throw Error('No verified native UID for this contact');
+  return { chatType: 1, peerUid: uid, guildId: '' };
+}
+
+function createDirect(session, self, settings, readJSON, writeJSON, authorize = () => {}) {
   if (settings.accountUin !== self.uin) throw Error('Direct contact configuration belongs to another account');
   const msgs = session.getMsgService();
 
-  async function resolvePeer(uin) {
-    const mapping = await session.getProfileService().getUidByUin('FriendsServiceImpl', [uin]);
-    const uid = mapping.get(uin);
-    if (typeof uid !== 'string' || !/^u_[A-Za-z0-9_-]+$/.test(uid) || uid === self.uid) {
-      throw Error('No verified native UID for this contact');
-    }
-    return { chatType: 1, peerUid: uid, guildId: '' };
-  }
-
   async function latest(uin) {
-    const peer = await resolvePeer(uin);
+    const peer = await resolvePeer(session, self, uin);
     const result = await msgs.getAioFirstViewLatestMsgs(peer, 1);
     checkedResult('getAioFirstViewLatestMsgs', result);
     if (!Array.isArray(result.msgList) || result.msgList.length > 1) throw Error('Invalid DM result');
@@ -34,8 +33,8 @@ function createDirect(session, self, settings, readJSON, writeJSON) {
         (m.senderUin && String(m.senderUin) !== '0' && String(m.senderUin) !== sender) ||
         !/^-?[1-9]\d*$/.test(String(m.msgId))) throw Error('Unverified DM sender or message ID');
     return {
-      message: { id: String(m.msgId), fromSelf, time: new Date(Number(m.msgTime) * 1000).toISOString(),
-        elements: m.elements.map((e) => e.textElement?.content ?? { elementType: e.elementType }) },
+      message: previewMessage({ id: String(m.msgId), fromSelf, time: new Date(Number(m.msgTime) * 1000).toISOString(),
+        elements: m.elements.map((e) => e.textElement?.content ?? { elementType: e.elementType }) }),
       replyPolicy: 'none',
     };
   }
@@ -54,7 +53,8 @@ function createDirect(session, self, settings, readJSON, writeJSON) {
     }
     const previous = existing();
     if (previous) return previous;
-    const peer = await resolvePeer(uin);
+    const peer = await resolvePeer(session, self, uin);
+    authorize(args.contact, uin);
     const raced = existing();
     if (raced) return raced;
     const receipt = { requestId, accountUin: self.uin, peerUin: uin, digest, state: 'unknown' };
@@ -77,4 +77,4 @@ function createDirect(session, self, settings, readJSON, writeJSON) {
     return sending ? send(uin, args) : latest(uin);
   };
 }
-module.exports = { createDirect };
+module.exports = { createDirect, resolvePeer };

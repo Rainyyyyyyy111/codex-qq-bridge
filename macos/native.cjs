@@ -32,4 +32,33 @@ function textElement(text) {
     textElement: { content: text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' },
   };
 }
-module.exports = { checkedResult, checkArgs, validateText, textElement };
+// Cap only the tool-facing element array. Native receipts and event checks use the original.
+function previewMessage(message) {
+  const limit = 8192;
+  let used = 2; // JSON array brackets
+  const elements = [];
+  for (const item of message.elements) {
+    const remaining = limit - used - (elements.length ? 1 : 0);
+    if (typeof item !== 'string' || item.length <= remaining) {
+      const bytes = Buffer.byteLength(JSON.stringify(item));
+      if (bytes <= remaining) {
+        used += bytes + (elements.length ? 1 : 0);
+        elements.push(item);
+        continue;
+      }
+    }
+    if (typeof item === 'string' && remaining >= 2) {
+      const prefix = n => item.slice(0,n).replace(/[\uD800-\uDBFF]$/, '');
+      let low = 0, high = Math.min(item.length, remaining);
+      while (low < high) {
+        const mid = Math.ceil((low+high)/2);
+        if (Buffer.byteLength(JSON.stringify(prefix(mid))) <= remaining) low = mid;
+        else high = mid-1;
+      }
+      elements.push(prefix(low));
+    }
+    return { ...message, elements, truncated:true };
+  }
+  return message;
+}
+module.exports = { checkedResult, checkArgs, validateText, textElement, previewMessage };

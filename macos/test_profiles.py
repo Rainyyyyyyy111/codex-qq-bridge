@@ -37,6 +37,16 @@ class Profiles(unittest.TestCase):
     def paths(self, profile):
         return self.bridge("--profile", profile, "paths").stdout.splitlines()
 
+    def test_pair_command_merges_contact_in_selected_profile(self):
+        state = Path(self.paths("studio")[0])
+        state.mkdir(parents=True)
+        config = state / "settings.json"
+        config.write_text(json.dumps({"accountUin":"101","contacts":{"known":"303","desk":"202"}}))
+        result = self.bridge("--profile", "studio", "collab", "pair", "202")
+        self.assertEqual(json.loads(result.stdout)["contact"], "desk")
+        self.assertEqual(json.loads(config.read_text())["contacts"], {"known":"303","desk":"202"})
+        self.assertFalse((Path(self.paths("default")[0]) / "settings.json").exists())
+
     def test_scopes_include_state_runtime_launchd_mcp_and_route(self):
         profiles = [self.paths(p) for p in ("default", "lab", "studio")]
         for dimension in zip(*profiles):

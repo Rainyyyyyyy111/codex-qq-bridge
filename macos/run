@@ -21,7 +21,10 @@ for framework in 'Electron Framework' 'QQNT'; do
 done
 cd "$state"
 if [[ "${1:-serve}" == serve && -f needs-selection.json && ! -f binding.json ]]; then
-  echo 'Group name ambiguous; operator selection required' >&2
-  exit 0
+  # A private cooperation peer is independent of the group's manual name selection.
+  if ! /usr/bin/python3 -c 'import json, os, sys; sys.exit(0 if os.path.isfile("settings.json") and json.load(open("settings.json")).get("collaborationContact") else 1)'; then
+    echo 'Group name ambiguous; operator selection required' >&2
+    exit 0
+  fi
 fi
 exec /usr/bin/env -i PATH=/usr/bin:/bin HOME="$state/home" CFFIXED_USER_HOME="$state/home" TMPDIR="$state/tmp/" LANG=en_US.UTF-8 QQ_STATE="$state" QQ_BRIDGE_PROFILE="${QQ_BRIDGE_PROFILE:-default}" /usr/bin/sandbox-exec -D "STATE=$state" -D "REALHOME=$HOME" -D "CODE=$code" -f "$code/worker.sb" "$bundle/MacOS/bridge" "$code/worker.cjs" "$@"

@@ -5,3 +5,5 @@
 创建返回后，将真实的 {"hostId":...,"threadId":...} 或 {"clientThreadId":...} 经 JSON 标准输入交给 BRIDGE_TRIGGER created 消息ID。用桌面 list_threads 的历史按正式 ID 查找，再用 read_thread 核对首条用户输入。将验证得到的 {"hostId":...,"threadId":...,"firstPrompt":...} 经 JSON 标准输入交给 BRIDGE_TRIGGER verified 消息ID。记录 dispatched 即结案。可继续 claim。
 
 如收到 reconcile 或创建结果不明，运行 BRIDGE_TRIGGER status。对 creating、awaiting、verifying 只核对原创建记录，禁止重建。awaiting 的正式回执要带 resolves，值为原 clientThreadId。无法唯一核实则保留原状态，向本地用户报告。无待办且无异常时保持静默。勿自动 arm 或 replay。
+
+若 created 或 verified 的本地登记响应丢失，可重交同一消息 ID 和原回执。相符的记录会得到成功响应，已核实的任务保持 dispatched。聊天 ID、主机或核验正文发生冲突时需核对原记录。

@@ -169,6 +169,33 @@ class DesignTests(unittest.TestCase):
         self.assertIsNone(self.q.claim())
         self.assertEqual(self.q.db.execute("SELECT state FROM tasks").fetchone(), ("dispatched",))
 
+    def test_receipt_retries_after_restart_never_reopen_a_dispatched_task(self):
+        for seq, queued in [(11, None), (12, "pending-2")]:
+            self.q.observe(msg(seq))
+            key, _ = self.q.claim()
+            if queued:
+                self.q.created(key, client_id=queued)
+                self.q.created(key, client_id=queued)
+            self.q.created(key, host="host", thread_id="actual", resolves=queued)
+            other = self.open()
+            try:
+                other.created(key, host="host", thread_id="actual", resolves=queued)
+                other.verified(key, "host", "actual", "示例")
+                other.verified(key, "host", "actual", "示例")
+                other.created(key, host="host", thread_id="actual", resolves=queued)
+                if queued:
+                    other.created(key, client_id=queued)
+                with self.assertRaises(ValueError):
+                    other.created(key, host="host", thread_id="different", resolves=queued)
+                with self.assertRaises(ValueError):
+                    other.created(key, client_id="different")
+                with self.assertRaises(ValueError):
+                    other.verified(key, "host", "actual", "another task")
+                self.assertIsNone(other.claim())
+                self.assertEqual(other.db.execute("SELECT state FROM tasks WHERE msg_id=?", (key,)).fetchone(), ("dispatched",))
+            finally:
+                other.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

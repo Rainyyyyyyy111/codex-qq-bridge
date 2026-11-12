@@ -7,6 +7,7 @@
 | 固定群收件 | Codex 调用 `read_latest` 或 `wait_next` | 查询最新一条，或从持久队列领取一条；控制账号的消息优先交付。 |
 | 固定群发信 | 用户确认全文后调用 `send_text` | 发送到已绑定的群，按请求号去重。 |
 | QQ 私聊（实验功能） | 本机先配置联系人别名，再调用 `read_dm_latest` 或 `send_dm_text` | 按需访问这一位联系人；只在手动调用时工作。 |
+| 双端协作私聊 | 双方互设协作联系人，用户在任一端提出任务 | 发起端写初稿，对端给出证据和修改意见，发起端完成修订并回传结果。 |
 | 群指令建聊 | 本机启用调度后，控制账号发送 `/task 路由 正文` | 对应的 Codex 创建一个无项目聊天，核对首条任务后在本地结案。 |
 
 ## 先跑离线验收
@@ -32,7 +33,7 @@ codex mcp get qq-bridge --json
 
 安装会探测原生模块、复制运行代码、注册当前 macOS 用户的 LaunchAgent，并向 Codex 注册 stdio MCP。打开新的 Codex 聊天后可调用工具。首次登录时 status 给出腾讯生成的二维码文件；用该协同账号扫码，等待 phase 变为 ready。之后登录同一 macOS 用户，launchd 会启动后台并尝试 QQ 快速登录。账号不接受快速登录时重新扫码。
 
-首次登录必须在此账号的群目录中精确找到「Codex共享chat」。如有同名群，先由本人选择候选群号，再运行 `./bridge choose 群号` 和 `launchctl kickstart "gui/$(id -u)/local.codex.qq-bridge"`。后续访问校验群号和登录身份。
+固定群功能首先在此账号的群目录中精确查找「Codex共享chat」。如有同名群，先由本人选择候选群号，再运行 `./bridge choose 群号` 和 `launchctl kickstart "gui/$(id -u)/local.codex.qq-bridge"`。配对私聊在原生账号登录后独立就绪，可用 `./bridge collab health` 单独核对。
 
 默认账号的目录和工具名与旧版兼容，已有的绑定、游标、回执和 SQLite 记录可由新版继续使用。升级前可在本机备份旧运行代码与私有状态。要在已运行的桥上做只读冒烟测试，执行下面的命令；它在临时目录独立加载 QQ 原生模块，再用当前源码的 MCP 客户端向运行中的默认后台读一次固定群，只输出检查结果。
 
@@ -94,7 +95,39 @@ launchctl kickstart -k "gui/$(id -u)/local.codex.qq-bridge-lab"
 
 工具和后台同时校验账号与联系人。删除别名后旧客户端的后续调用也会被拒绝。用户在本地明确确认全文后才调用发送。DM 的 accepted 表示原生接口接受请求，unknown 表示结果待核对。发生断线沿用同一个请求号。私聊结果按数据交付，replyPolicy 为 none，即便内容看起来像 /task 也只返回文字。私聊工具当前依赖该配置的群服务已经 ready。
 
+## 和 Windows 账号直接协作
+
+从 ZIP 解压后进入顶层 `codex-qq-bridge` 目录。准备已互加好友的两个 QQ 协同账号、Apple Silicon Mac、已验证版本的 QQ、支持 `node:sqlite` 的 Node 22.13+ 和已登录的 Codex CLI。在下面命令中将 `WINDOWS_QQ` 和 `MAC_QQ` 换为实际账号。
+
+```sh
+./macos/bridge collab pair WINDOWS_QQ MAC_QQ
+./macos/bridge install
+./macos/bridge status
+./macos/bridge collab health
+```
+
+已有配置或本机已登录过这个账号时，第一条只需 `./macos/bridge collab pair WINDOWS_QQ`。`pair` 会核对设置和已有登录绑定，保留联系人并优先复用已关联该 QQ 的别名。同一配对可重复执行。已有其他配对的用户可给另一账号建立独立 profile，所有命令使用相同的 `--profile 名称`。普通联系人继续使用手动收发工具，协作收件箱只处理配对好友发来的协议消息。
+
+首次登录时查看 `status` 返回的 `qrFile`，在本机打开并用指定 Mac 协同账号扫码，然后再次运行 `collab health`。安装刚启动时控制端点可能尚未出现。健康结果应显示 `ready: true`，表示本机已核实好友 UID 且有可用的原生推送订阅或历史补读；双方的实际收发由双机验收验证。
+
+如需让这一端参考独有资料，可在配对后将允许本机 Codex 引用的 UTF-8 节选（最多 8 KiB）存为 `./macos/bridge collab paths` 显示目录下的 `collaboration-evidence.txt`，再运行安装。协作 LaunchAgent 在 QQ 原生沙箱之外运行普通 Node 进程。以下示例从 `macos/` 目录执行。
+
+新开 Codex 聊天即可使用独立的 `qq-collaboration` MCP（具名账号为 `qq-collaboration-lab`）。可要求“请和 Windows 一起评审这个方案，列出对端给出的证据和最终采纳的修改”。也可从本机终端提交已有草稿。
+
+```sh
+./bridge collab health
+echo '{"request_id":"review-restart-1","task":"核对跨端重启后会不会重复领取","draft":"初稿假设双方共用一份状态库","question":"请用 Windows 端的实际约束检查这个假设"}' | ./bridge collab submit
+./bridge collab status --id 返回的任务编号
+./bridge collab wait --id 返回的任务编号 --timeout-ms 30000
+```
+
+原生消息回调先将对端帧按 QQ 消息 ID 去重、落盘，再立即唤醒等待中的本机进程。启动时及每 5 秒补查最近 32 条。已保存游标出现间隙时尝试分页追赶；原生接口缺少历史页时保留缺口。新启用的配对只接收启用时刻之后的帧。普通群聊、来自自己的消息、转发、其他私聊都不会推进合作。Mac 真机上的私聊回调时延和断线历史范围需要在目标 QQ 版本实测。
+
+删除 `collaborationContact` 后，后台会拒绝新的协作收发。再次执行安装会移除本账号的协作 LaunchAgent 和独立 MCP。任务、协作私聊游标和回执保存在各自账号的本地状态目录。仅切换联系对象时，请给新配对单独的账号配置或状态目录，避免混用尚在进行的任务。
+
 ## 群消息、事件与桌面任务
+
+桌面任务只把本条指令的正文交给新聊天，完整的 `/task` 指令最多 16,000 个 UTF-16 码元。群读工具和联系人私聊读工具每次返回一条，每条的 `elements` 数组按实际 JSON 的 UTF-8 编码最多 8 KiB，超出时结果带有 `truncated: true`。协议校验和发送回读使用原始消息。群后台的待领队列与 Codex 聊天记录分别保存；在同一聊天里连续调用工具时，先前的工具结果仍属于该聊天。
 
 - read_latest 校验群号后返回当前最新一条，包括本人消息。wait_next 按 owner 优先、同级 FIFO 领取，忽略本人和未知发送者；超时范围 0–45000 毫秒。状态文件一次替换同时保存游标、近期 ID、待领消息和事件。领取后客户端断连可能错过这次交付。
 - send_text 使用独立的 request_id。accepted 表示原生接口接受，confirmed 表示在绑定群回读匹配到关联 ID，observed_in_group 表示回读匹配了含唯一请求号的正文。繁忙群的回读可以继续到后续历史页。
@@ -113,7 +146,7 @@ launchctl kickstart -k "gui/$(id -u)/local.codex.qq-bridge-lab"
 | 私聊显示绑定改变或无法解析 UID | 核对本机账号和别名；重启服务及客户端。受支持的 QQ 版本必须能为指定好友解析 UID。 |
 | 建聊中断 | 用 trigger status 核对原记录与 Codex 桌面历史；已认领任务只做核对，避免重复建聊。 |
 
-移除 lab 服务时先暂停其桌面调度，再执行以下命令。私有数据可由操作者单独归档。
+移除 lab 服务时先暂停其桌面调度。若已启用配对，还需删除 lab 的 `collaborationContact` 并运行 `./bridge --profile lab install`，让安装器一并撤除协作服务和协作 MCP。然后执行以下命令。私有数据可由操作者单独归档。
 
 ```sh
 launchctl bootout "gui/$(id -u)/local.codex.qq-bridge-lab"
@@ -123,6 +156,6 @@ codex mcp remove qq-bridge-lab
 
 ## Windows 集成
 
-macos/ 可作为统一仓库的独立子目录提交。events.cjs 管理跨端的群事件协议，trigger.py 实现 /task 路由与认领；Windows 可复用协议测试与测试输入。worker.cjs、host.c、run 和 install 对应 Mac QQ 的原生宿主与启动方式。Windows 的登录、原生私聊与发布由 Windows 端另行验收。
+`worker.cjs`、`host.c`、`run` 和 `install` 连接 Mac 原生 QQ。两个平台共同使用仓库中的 `collaboration/` 完成配对协作。对端需要在它自己的 QQ 账号上配置反向配对。[Windows 配置](../windows/README.md) · [双端流程与验收](../collaboration/README.md)
 
 原生接口参考了 [NapCat 的消息适配](https://github.com/NapNeko/NapCatQQ/blob/v2.6.14/src/core/apis/msg.ts) 和 [UIN 到 UID 的映射调用](https://github.com/NapNeko/NapCatQQ/blob/v2.6.14/src/core/apis/user.ts)。运行只依赖用户已有的腾讯 QQ 和本机工具。

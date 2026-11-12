@@ -49,6 +49,20 @@ function setup() {
   return { service, rows, message, start, db };
 }
 const wait = (g) => g.call('wait_next', { timeout_ms: 100 }, () => true);
+test('group tool reads bound serialized previews and keep event routing metadata', async () => {
+  const t = setup(), group = t.start();
+  await group.initialize();
+  const row = t.message(2);
+  row.elements = [{textElement:{content:'😀\u0000'.repeat(5000)}}];
+  t.rows.push(row);
+  await group.sync();
+  for (const value of [await group.call('read_latest', {}), (await wait(group)).message]) {
+    assert.equal(value.id, '2');
+    assert.equal(value.truncated, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(value.elements))<=8192);
+    assert.ok(!value.elements[0].endsWith('\uD83D'));
+  }
+});
 test('only other senders, one stable ID once across bursts and restart', async () => {
   const t = setup(),
     g = t.start();
