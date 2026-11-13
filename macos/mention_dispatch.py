@@ -14,8 +14,9 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 
+from mention_routing import ASK, plan, stored
 from trigger import TriggerQueue
 from triggerctl import ROUTE, STATE, bridge_call, history
 
@@ -154,67 +155,137 @@ def verify(server, q, key, thread_id):
     raise RuntimeError("Codex history has no matching first user message yet")
 
 
-def dispatch(server, q, key, cwd):
-    claim = q.claim(only_id=key, group_reply=True)
-    if not claim:
-        return
-    _, task = claim
-    created = server.call("thread/start", {
-        "cwd": str(cwd), "sandbox": "workspace-write", "approvalPolicy": "never", "ephemeral": False,
-        "developerInstructions": "这是绑定的人类控制账号在 QQ 群里 @ 你发起的任务。在本地完成工作；桥接会把你的最终答复作为一条纯文本发回原群。用适合群里阅读的简洁文字，仅写可以在群里公开的内容。不要自行发信、呼叫其他账号或操作桥接队列、arm、replay。",
-    })
-    thread_id = created["thread"]["id"]
-    q.created(key, host="local", thread_id=thread_id)
-    result = server.call("turn/start", {"threadId": thread_id,
-        "input": [{"type": "text", "text": task["prompt"], "text_elements": []}]})
-    turn_id = result["turn"]["id"]
-    try:
-        server.call("thread/name/set", {"threadId": thread_id, "name": task["title"]})
-        verify(server, q, key, thread_id)
-        print(f"dispatched msg={key} thread={thread_id}", flush=True)
-    finally:
-        status = server.wait_turn(turn_id)
-        print(f"turn {status} msg={key} thread={thread_id}", flush=True)
+def role_prompt(route):
+    device = "Windows" if route == "win" else "Mac"
+    return (
+        f"你在 {device} 端处理绑定 QQ 群中人类控制者点名的工作。每一轮用户消息对应一次点名。"
+        "续聊沿用本对话和原任务目录。另开任务使用独立目录，若桥接附有参考稿，只将其当作材料。"
+        "只把本机实际核对过的情况写成事实。每轮最终答复会作为纯文本发回原群，"
+        "只写适合全群公开的内容。不要自行发信、呼叫其他账号或操作桥接队列、arm、replay。"
+    )
 
 
-def final_answer(server, thread_id, expected_prompt):
+def read_thread(server, thread_id):
     thread = server.call("thread/read", {"threadId": thread_id, "includeTurns": True})["thread"]
     if thread["id"] != thread_id:
         raise ValueError("Codex thread identity mismatch")
+    return thread
+
+
+def user_text(turn):
+    user = next((item for item in turn["items"] if item["type"] == "userMessage"), None)
+    if user is None:
+        return None
+    content = user["content"]
+    if len(content) != 1 or content[0].get("type") != "text":
+        raise ValueError("Unexpected QQ turn input")
+    return content[0]["text"]
+
+
+def final_answer(server, thread_id, expected_prompt, turn_id=None):
+    thread = read_thread(server, thread_id)
     for turn in thread["turns"]:
-        items = turn["items"]
-        user = next((item for item in items if item["type"] == "userMessage"), None)
-        if user is None:
+        if turn_id and turn.get("id") != turn_id:
             continue
-        content = user["content"]
-        if len(content) != 1 or content[0].get("type") != "text" or content[0].get("text") != expected_prompt:
-            raise ValueError("Initial task does not match the controller mention")
+        prompt = user_text(turn)
+        if prompt is None:
+            continue
+        if prompt != expected_prompt:
+            raise ValueError("Turn input differs from the controller mention")
         if turn["status"] in ("failed", "interrupted"):
-            raise ValueError("Initial turn ended without a deliverable final answer")
+            raise ValueError("Turn ended without a deliverable final answer")
+        if turn["status"] == "inProgress":
+            raise ThreadBusy()
         if turn["status"] != "completed":
             break
-        for item in reversed(items):
+        for item in reversed(turn["items"]):
             if item["type"] == "agentMessage" and item.get("phase") == "final_answer" and item["text"].strip():
                 return item["text"]
-        # Older providers omit phase. Only a terminal assistant message qualifies.
-        last = items[-1]
+        last = turn["items"][-1]
         if last["type"] == "agentMessage" and last.get("phase") is None and last["text"].strip():
             return last["text"]
         break
-    raise RuntimeError("Initial turn has no completed final answer yet")
+    raise RuntimeError("Turn has no completed final answer yet")
 
 
-def deliver(server, q, key):
-    entry = q.db.execute(
-        "SELECT seq,body,thread_id FROM tasks WHERE grp=? AND msg_id=? AND origin='mention' "
-        "AND state='dispatched' AND reply_state='pending'", (q.group, key),
-    ).fetchone()
-    if not entry:
+class ThreadBusy(Exception):
+    """Yield the worker slot while an earlier turn owns this thread."""
+
+
+def prior_material(server, q, task):
+    src = stored(q, task["source_id"])
+    if src["published"] is not None:
+        return src["published"]
+    # Published by the previous bridge: only its first verified turn was sent.
+    if src["action"] is None and src["state"] == "dispatched" and src["thread_id"]:
+        answer = final_answer(server, src["thread_id"], src["body"])
+        # Old receipts lack the text. Only carry a prefix guaranteed to fit in the old group reply.
+        if len(answer.encode("utf-16-le")) <= 7600:
+            return answer
+        return answer.encode("utf-16-le")[:7400].decode("utf-16-le", errors="ignore") + "…（原群终答节选）"
+    raise ValueError("Published source text unavailable")
+
+
+def dispatch(server, q, key, cwd):
+    task = stored(q, key)
+    if task["state"] != "pending":
         return
-    seq, prompt, thread_id = entry
-    answer = final_answer(server, thread_id, prompt)
+    if task["action"] is None:
+        task = plan(q, key, {})  # Direct callers handling a plain mention.
+    instructions = role_prompt(q.route)
+    options = {"cwd": str(cwd), "sandbox": "workspace-write", "approvalPolicy": "never",
+               "developerInstructions": instructions}
+    prompt = task["body"]
+    if task["clarification_id"]:
+        original = stored(q, task["clarification_id"])
+        prompt += "\n\n控制者先前待确认的要求：\n" + original["body"]
+    if task["action"] == "fork":
+        src = stored(q, task["source_id"])
+        reference = prior_material(server, q, task)
+        # Keep quoted text at user priority, out of developerInstructions. One user
+        # message preserves turn attribution and can be verified exactly on recovery.
+        prompt += "\n\n参考资料（群任务 #" + str(src["seq"]) + " 的已发布终稿）：\n" + reference
+    if task["action"] == "resume":
+        root = stored(q, task["root_id"])
+        thread_id = root["thread_id"]
+        if not thread_id:
+            raise ValueError("Original chat has no verified thread ID")
+        thread = read_thread(server, thread_id)
+        first = next((t for t in thread["turns"] if any(i["type"]=="userMessage" for i in t["items"])), None)
+        if first is None or user_text(first) != (root["submitted"] or root["body"]):
+            raise ValueError("Original QQ task does not match this thread")
+        if any(t["status"] == "inProgress" for t in thread["turns"]):
+            raise ThreadBusy()
+        resumed = server.call("thread/resume", {"threadId": thread_id, **options})["thread"]
+        if resumed["id"] != thread_id:
+            raise ValueError("Resumed a different Codex thread")
+    claim = q.claim(only_id=key, group_reply=True)
+    if not claim:
+        return
+    if task["action"] != "resume":
+        created = server.call("thread/start", {**options, "ephemeral": False})
+        thread_id = created["thread"]["id"]
+    q.created(key, host="local", thread_id=thread_id)
+    # Commit the submitted text before the non-idempotent request. Never replay a
+    # turn/start whose acknowledgement was lost.
+    previous = thread["turns"][-1]["id"] if task["action"] == "resume" and thread["turns"] else ""
+    q.db.execute("UPDATE mention_turns SET submitted=?,previous_turn=? WHERE msg_id=?", (prompt, previous, key))
+    result = server.call("turn/start", {"threadId": thread_id,
+        "input": [{"type": "text", "text": prompt, "text_elements": []}]})
+    turn_id = result["turn"]["id"]
+    q.db.execute("UPDATE mention_turns SET turn_id=? WHERE msg_id=?", (turn_id, key))
+    if task["action"] != "resume":
+        server.call("thread/name/set", {"threadId": thread_id, "name": claim[1]["title"]})
+    status = server.wait_turn(turn_id)
+    if status != "completed":
+        raise ValueError("QQ work turn ended: " + str(status))
+    print(f"turn {status} msg={key} thread={thread_id} turn={turn_id}", flush=True)
+
+
+def publish(q, task, answer):
+    key = task["msg_id"]
     receipt = bridge_call("reply_to_mention", {
-        "seq": str(seq), "id": key, "group": q.group, "owner": q.owner, "account": q.account,
+        "seq": str(task["seq"]), "id": key, "group": q.group, "owner": q.owner, "account": q.account,
         "text": answer[:4001],
     })
     if receipt.get("requestId") != "mention-reply-" + key or receipt.get("groupCode") != q.group:
@@ -222,14 +293,55 @@ def deliver(server, q, key):
     status = receipt.get("state")
     if status not in ("accepted", "confirmed", "observed_in_group", "unknown"):
         raise ValueError("Unexpected QQ reply receipt")
-    q.db.execute("UPDATE tasks SET reply_state=? WHERE grp=? AND msg_id=? AND reply_state='pending'",
-                 (status, q.group, key))
+    with q.transaction():
+        if task["action"] == "clarify":
+            q.db.execute("UPDATE tasks SET state='clarified' WHERE msg_id=?", (key,))
+        q.db.execute("UPDATE tasks SET reply_state=? WHERE msg_id=?", (status, key))
+        q.db.execute("UPDATE mention_turns SET reply_id=?,reply_seq=?,published=? WHERE msg_id=?",
+                     (receipt.get("messageId"), receipt.get("messageSeq"), receipt.get("publishedText"), key))
+    print(f"QQ reply {status} source={task['seq']} message={receipt.get('messageId', '-')}", flush=True)
     if status == "unknown":
         raise ValueError("QQ delivery outcome unknown; retained native receipt for review")
-    print(f"QQ reply {status} source={seq} message={receipt.get('messageId', '-')}", flush=True)
 
 
-def handle(marker):
+def recover_turn(server, q, task):
+    if not task["submitted"] or task["previous_turn"] is None:
+        raise ValueError("Turn submission outcome requires manual review")
+    turns = read_thread(server, task["thread_id"])["turns"]
+    ids = [turn["id"] for turn in turns]
+    previous = task["previous_turn"]
+    if previous and previous not in ids:
+        raise ValueError("Cannot locate pre-submission turn")
+    after = turns[ids.index(previous)+1:] if previous else turns
+    if len(after) != 1 or user_text(after[0]) != task["submitted"]:
+        raise ValueError("Cannot uniquely identify submitted QQ turn; retained for review")
+    turn_id = after[0]["id"]
+    q.db.execute("UPDATE mention_turns SET turn_id=? WHERE msg_id=?", (turn_id, task["msg_id"]))
+    return turn_id
+
+
+def deliver(server, q, key):
+    task = stored(q, key)
+    if task["reply_state"] != "pending":
+        return
+    if task["action"] == "clarify":
+        publish(q, task, ASK)
+        return
+    answer = task["final"]
+    if answer is None:
+        turn_id = task["turn_id"]
+        if task["action"] and not turn_id:
+            turn_id = recover_turn(server, q, task)
+        answer = final_answer(server, task["thread_id"], task["submitted"] or task["body"], turn_id)
+        with q.transaction():
+            q.db.execute("UPDATE tasks SET state='dispatched' WHERE msg_id=?", (key,))
+            q.db.execute("UPDATE mention_turns SET final=? WHERE msg_id=?", (answer, key))
+        print(f"dispatched msg={key} thread={task['thread_id']}", flush=True)
+    publish(q, task, answer)
+
+
+@contextmanager
+def verified_mention(marker):
     match = MARKER.fullmatch(marker.name)
     if not match:
         raise ValueError("Invalid wake file")
@@ -245,32 +357,52 @@ def handle(marker):
         if not row.get("mentionPrompt") or str(row["senderUin"]) != q.owner or int(seq) <= q.enabled_after:
             raise ValueError("Native history did not confirm a new controller mention")
         q.observe(row)
-        entry = q.db.execute("SELECT seq,body,origin,state,thread_id,reply_state FROM tasks WHERE grp=? AND msg_id=?",
-                             (q.group, key)).fetchone()
-        if not entry or entry[:3] != (int(seq), row["mentionPrompt"], "mention"):
+        entry = stored(q, key)
+        if not entry or (entry["seq"], entry["body"]) != (int(seq), row["mentionPrompt"]):
             raise ValueError("Durable task differs from native mention")
-        state, thread_id, reply_state = entry[3:]
-        if reply_state == "unknown":
-            raise ValueError("QQ reply outcome requires manual review")
-        if state == "dispatched" and reply_state != "pending":
+        yield q, plan(q, key, row)
+    finally:
+        q.db.close()
+
+
+def handle(marker):
+    with verified_mention(marker) as (q, task):
+        key, reply = task["msg_id"], task["reply_state"]
+        if reply == "unknown" or task["state"] in ("creating", "uncertain", "failed"):
+            raise ValueError("Task or group reply requires manual review")
+        if task["state"] in ("dispatched", "clarified") and reply != "pending":
             return
-        if state not in ("pending", "verifying", "dispatched"):
-            raise ValueError("Creation outcome requires manual review: " + state)
+        if task["action"] == "clarify":
+            q.db.execute("UPDATE tasks SET reply_state='pending' WHERE msg_id=? AND reply_state IS NULL", (key,))
+            deliver(None, q, key)
+            return
+        if task["source_id"]:
+            source = stored(q, task["source_id"])
+            if (source["state"] in ("failed", "uncertain", "clarified") or source["reply_state"] == "unknown" or
+                    (source["reply_state"] == "pending" and (REVIEW / (str(source["seq"])+"_"+source["msg_id"])).is_file())):
+                if task["state"] == "pending":
+                    q.db.execute("UPDATE mention_turns SET action='clarify' WHERE msg_id=?", (key,))
+                    q.db.execute("UPDATE tasks SET reply_state='pending' WHERE msg_id=?", (key,))
+                    deliver(None, q, key)
+                    return
+            if source["state"] != "dispatched" or source["reply_state"] == "pending":
+                raise ThreadBusy()
         cwd = Path.home() / "Codex/QQ任务"
         if ROUTE == "win":
             cwd = cwd / ROUTE / q.account / q.group
         elif ROUTE != "mac":
             cwd = cwd / ROUTE
-        cwd = cwd / key
+        cwd = cwd / task["root_id"]
         cwd.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if task["final"] is not None:
+            deliver(None, q, key)
+            return
         with AppServer() as server:
-            if state == "verifying":
-                verify(server, q, key, thread_id)
-            elif state == "pending":
+            if task["state"] == "pending":
                 dispatch(server, q, key, cwd)
+            elif task["state"] == "verifying" and not task["action"]:
+                verify(server, q, key, task["thread_id"])  # first-turn-only legacy record
             deliver(server, q, key)
-    finally:
-        q.db.close()
 
 
 def process(marker):
@@ -281,12 +413,25 @@ def process(marker):
             handle(marker)
             marker.unlink(missing_ok=True)
             return
+        except ThreadBusy:
+            time.sleep(0.5)
+            return  # leave marker for a later pass without occupying a worker
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
             print(f"mention {marker.name}: {exc}", file=sys.stderr, flush=True)
             if isinstance(exc, ValueError):
                 break
     REVIEW.mkdir(mode=0o700, exist_ok=True)
     marker.replace(REVIEW / marker.name)
+    match = MARKER.fullmatch(marker.name)
+    if match and (STATE / "tasks.sqlite3").is_file():
+        path = (STATE / "tasks.sqlite3").resolve().as_uri() + "?mode=rw"
+        try:
+            with closing(sqlite3.connect(path, uri=True)) as db, db:
+                db.execute("""UPDATE tasks SET state='uncertain' WHERE msg_id=? AND origin='mention'
+                           AND state IN ('creating','verifying','pending')""", (match[2],))
+        except sqlite3.Error as error:
+            print(f"mention {marker.name}: retained for review: {error}", file=sys.stderr, flush=True)
+
 
 
 def main():
@@ -298,28 +443,62 @@ def main():
         watch_directory()
 
 
+def schedule(active, pool, plans, notify=None):
+    # Freeze plans in native sequence order before submitting concurrent jobs.
+    # Only one worker at a time owns a conversation, including during reply publication.
+    for marker in list(active):
+        if active[marker][0].done():
+            active.pop(marker)[0].result()
+    occupied = {root for _, root in active.values()}
+    for marker in list(plans):
+        if not marker.exists():
+            del plans[marker]
+    markers = sorted(WAKE.iterdir(), key=lambda p: int(p.name.split("_")[0]) if MARKER.fullmatch(p.name) else 0)
+    for marker in markers:
+        if marker in active or len(active) >= 4:
+            continue
+        try:
+            if marker not in plans:
+                with verified_mention(marker) as (_, task):
+                    plans[marker] = (task["root_id"], task["source_id"])
+            root, parent = plans[marker]
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            # process() performs the bounded retry and preserves a failed marker for review.
+            root = marker.name
+            # An unresolved earlier marker may address any conversation.
+            if active:
+                break
+            future = pool.submit(process, marker)
+            active[marker] = future, root
+            if notify:
+                future.add_done_callback(notify)
+            break
+        if root in occupied or (parent and any(p.name.endswith("_" + parent) for p in active)):
+            continue
+        future = pool.submit(process, marker)
+        active[marker] = future, root
+        occupied.add(root)
+        if notify:
+            future.add_done_callback(notify)
+
+
 def watch_directory():
     # launchd starts us on a nonempty directory. kqueue catches additional work
     # immediately, including while an earlier chat is still working.
     if os.name == "nt" or "--watch" in sys.argv:
         # Windows group mode is supervised by the foreground dispatcher command.
         with ThreadPoolExecutor(max_workers=4) as pool:
-            active = {}
+            active, plans = {}, {}
             while True:
                 binding = os.environ.get("QQ_MENTION_BINDING")
                 if binding:
                     cfg = json.loads(Path(binding).read_text(encoding="utf-8"))
                     if not cfg or hashlib.sha256(cfg["token"].encode()).hexdigest()[:24] != STATE.name:
                         return
-                for marker in list(active):
-                    if active[marker].done():
-                        active.pop(marker).result()
-                for marker in WAKE.iterdir():
-                    if marker not in active and len(active) < 4:
-                        active[marker] = pool.submit(process, marker)
+                schedule(active, pool, plans)
                 time.sleep(0.25)
     directory = os.open(WAKE, os.O_RDONLY)
-    active = {}
+    active, plans = {}, {}
     reader, writer = socket.socketpair()
     try:
         with closing(select.kqueue()) as events, reader, writer, ThreadPoolExecutor(max_workers=4) as pool:
@@ -328,14 +507,7 @@ def watch_directory():
                        select.kevent(reader.fileno(), filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)]
             events.control(changes, 0, 0)
             while True:
-                for marker in list(active):
-                    if active[marker].done():
-                        active.pop(marker).result()
-                for marker in WAKE.iterdir():
-                    if marker not in active and len(active) < 4:
-                        future = pool.submit(process, marker)
-                        active[marker] = future
-                        future.add_done_callback(lambda _: writer.send(b'x'))
+                schedule(active, pool, plans, lambda _: writer.send(b'x'))
                 if not active:
                     return
                 for event in events.control(None, 2):

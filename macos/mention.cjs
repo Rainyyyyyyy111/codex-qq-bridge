@@ -19,6 +19,8 @@ function mentionPrompt(raw, binding, owner) {
   let addressed = false, hasTaskText = false;
   const body = [];
   for (const e of raw.elements) {
+    // QQ's quote preview is never a task or evidence of the quoted sender.
+    if (e?.elementType === 7 && e.replyElement) continue;
     if (e?.elementType !== 1 || !e.textElement) return null;
     const t = e.textElement;
     if (t.atType === 0 && typeof t.content === 'string') {

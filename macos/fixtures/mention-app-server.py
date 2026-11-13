@@ -17,6 +17,8 @@ for line in sys.stdin:
     if method == "thread/start":
         assert params["ephemeral"] is False
         assert Path(params["cwd"]).is_relative_to(Path(os.environ["FIXTURE_TASK_HOME"]))
+        device = "Windows" if os.environ["QQ_BRIDGE_ROUTE"] == "win" else "Mac"
+        assert device + " 端" in params["developerInstructions"]
         result = {"thread": {"id": thread}}
         with log.open("a", encoding="utf-8") as f:
             f.write("created\n")
@@ -26,7 +28,7 @@ for line in sys.stdin:
     elif method == "thread/list":
         result = {"data": [{"id": thread}], "nextCursor": None}
     elif method == "thread/read":
-        result = {"thread": {"id": thread, "turns": [{"status": "completed", "items": [
+        result = {"thread": {"id": thread, "turns": [{"id": "first-turn", "status": "completed", "items": [
             {"type": "userMessage", "content": [{"type": "text", "text": prompt}]},
             {"type": "agentMessage", "phase": "commentary", "text": "进度"},
             {"type": "agentMessage", "phase": "final_answer", "text": "已完成：" + prompt},

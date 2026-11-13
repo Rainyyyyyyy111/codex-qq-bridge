@@ -25,7 +25,7 @@ if [[ "$paired" == yes ]]; then "$nodebin" -e "require('node:sqlite').DatabaseSy
 mkdir -p "$runtime" "$state" "${plist:h}"
 print -r -- "$QQ_BRIDGE_PROFILE" > "$runtime/installed-profile.new.$$"
 mv "$runtime/installed-profile.new.$$" "$runtime/installed-profile"
-for file in mention.cjs mention_dispatch.py install-mention bridge settings.cjs direct.cjs paired-dm.cjs native.cjs host.c Info.plist run worker.sb worker.cjs group.cjs events.cjs ipc.cjs mcp.cjs trigger.py triggerctl.py dispatcher.md; do
+for file in mention.cjs mention_routing.py mention_dispatch.py install-mention bridge settings.cjs direct.cjs paired-dm.cjs native.cjs host.c Info.plist run worker.sb worker.cjs group.cjs events.cjs ipc.cjs mcp.cjs trigger.py triggerctl.py dispatcher.md; do
   if [[ "$code" != "$runtime" ]]; then cp "$code/$file" "$runtime/$file.new.$$"; mv "$runtime/$file.new.$$" "$runtime/$file"; fi
 done
 if [[ -f "$shared/service.cjs" && "$shared" != "$runtime/collaboration" ]]; then

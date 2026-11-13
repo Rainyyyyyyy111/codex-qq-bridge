@@ -5,6 +5,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from mention_routing import install_schema
+
 ROUTE_NAME = r"(?:mac|win|acct-[a-z][a-z0-9-]{0,23})"
 ROUTE = re.compile(r"/task +(" + ROUTE_NAME + r") +")
 
@@ -70,6 +72,7 @@ class TriggerQueue:
         """
         )
         with self.transaction():
+            install_schema(self.db)
             if "updated" not in {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}:
                 self.db.execute("ALTER TABLE tasks ADD COLUMN updated INTEGER NOT NULL DEFAULT 0")
             if "origin" not in {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}:

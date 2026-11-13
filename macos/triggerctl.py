@@ -87,10 +87,13 @@ def run(args):
         if args.action == "verified":
             evidence = json.load(sys.stdin)
             q.verified(args.msg_id, evidence["hostId"], evidence["threadId"], evidence["firstPrompt"])
-        rows = q.db.execute("SELECT msg_id,seq,state,host,thread_id,client_id,origin,reply_state FROM tasks ORDER BY seq DESC LIMIT 25")
+        rows = q.db.execute("""SELECT t.msg_id,t.seq,t.state,t.host,t.thread_id,t.client_id,t.origin,t.reply_state,
+            m.action,m.root_id,m.source_id,m.turn_id,m.reply_seq FROM tasks t LEFT JOIN mention_turns m USING(msg_id)
+            ORDER BY seq DESC LIMIT 25""")
         return {"group": q.group, "account": q.account, "owner": q.owner, "armedAfter": q.enabled_after,
                 "cursor": cursor, "top": live["top"], "recent": [dict(zip(
-                    ("msgId", "seq", "state", "hostId", "threadId", "clientThreadId", "origin", "replyState"), row)) for row in rows]}
+                    ("msgId", "seq", "state", "hostId", "threadId", "clientThreadId", "origin", "replyState",
+                     "action", "rootMsgId", "sourceMsgId", "turnId", "replySeq"), row)) for row in rows]}
     finally:
         q.db.close()
 

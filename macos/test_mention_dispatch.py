@@ -1,6 +1,7 @@
 import os
 import select
 import threading
+from contextlib import nullcontext
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ class Server:
     def call(self, method, params):
         self.calls.append(method)
         if method == 'thread/start':
+            self.instructions = params['developerInstructions']
             return {'thread': {'id': 'real-id'}}
         if method == 'turn/start':
             self.prompt = params['input'][0]['text']
@@ -29,7 +31,6 @@ class Server:
             self.visible = True
             return {'data': [{'id': 'real-id'}], 'nextCursor': None}
         if method == 'thread/read':
-            assert self.visible
             item = {'type': 'userMessage', 'content': [{'type': 'text', 'text': self.prompt}]}
             return {'thread': {'id': 'real-id', 'turns': [{'items': [item]}]}}
         raise AssertionError(method)
@@ -68,9 +69,11 @@ class MentionDispatchTests(unittest.TestCase):
             self.q.observe(self.row)
             dispatch(self.server, self.q, '19', self.cwd)
         self.assertEqual(self.server.calls,
-                         ['thread/start', 'turn/start', 'thread/name/set', 'thread/list', 'thread/read'])
+                         ['thread/start', 'turn/start', 'thread/name/set'])
         self.assertEqual(self.server.prompt, self.row['mentionPrompt'])
-        self.assertEqual(self.q.db.execute('SELECT state FROM tasks').fetchone(), ('dispatched',))
+        self.assertIn('Mac 端', self.server.instructions)
+        self.assertNotIn(self.server.prompt, self.server.instructions)
+        self.assertEqual(self.q.db.execute('SELECT state FROM tasks').fetchone(), ('verifying',))  # deliver verifies the exact turn before publishing it.
 
     def test_plain_text_and_legacy_pending_never_dispatched(self):
         self.q.observe(dict(self.row, mentionPrompt=None, elements=[
@@ -127,7 +130,9 @@ class MentionDispatchTests(unittest.TestCase):
         old_umask = os.umask(0o077)
         try:
             with patch('mention_dispatch.STATE', self.cwd), patch('mention_dispatch.WAKE', wake), \
-                    patch('mention_dispatch.process', consume):
+                    patch('mention_dispatch.process', consume), \
+                    patch('mention_dispatch.verified_mention', side_effect=lambda p: nullcontext(
+                        (None, {'root_id': p.name, 'source_id': None}))):
                 main()
         finally:
             os.chdir(old_cwd)
@@ -139,9 +144,9 @@ class MentionDispatchTests(unittest.TestCase):
         self.q.observe(self.row)
         dispatch(self.server, self.q, '19', self.cwd)
         user = {'type':'userMessage', 'content':[{'type':'text', 'text':self.row['mentionPrompt']}]}
-        first = {'status':'completed', 'items':[user, {'type':'agentMessage','phase':'commentary','text':'进度'},
+        first = {'id':'turn1','status':'completed', 'items':[user, {'type':'agentMessage','phase':'commentary','text':'进度'},
                                                {'type':'agentMessage','phase':'final_answer','text':'完成了'}]}
-        later = {'status':'completed', 'items':[user, {'type':'agentMessage','phase':'final_answer','text':'别的答案'}]}
+        later = {'id':'turn2','status':'completed', 'items':[user, {'type':'agentMessage','phase':'final_answer','text':'别的答案'}]}
         result = {'thread':{'id':'real-id', 'turns':[first,later]}}
         receipt = {'state':'observed_in_group','requestId':'mention-reply-19','groupCode':'123'}
         with patch.object(self.server,'call',return_value=result), patch('mention_dispatch.bridge_call',return_value=receipt) as post:

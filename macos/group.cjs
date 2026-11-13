@@ -82,6 +82,44 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
       .filter(({ m }) => BigInt(m.seq) >= start && BigInt(m.seq) <= end)
       .sort((a, b) => Number(BigInt(a.m.seq) - BigInt(b.m.seq)));
   }
+  function replyText(seq, answer) {
+    const full = '回复 #' + seq + '\n' + answer;
+    const suffix = mentionsOnly ? '\n（完整回复见 Windows 上的 Codex 对话）' : '\n（完整回复见 Mac 上的 Codex 对话）';
+    return full.length <= 4000 ? full : full.slice(0,4000-suffix.length).replace(/[\uD800-\uDBFF]$/, '') + suffix;
+  }
+
+  // Some QQ builds report replayMsgId=0. Resolve the sequence in this exact group;
+  // sourceMsgIdInRecords identifies a preview record, not necessarily the original message.
+  async function quotedTask(raw) {
+    const quotes = raw.elements.filter(e=>e?.elementType===7);
+    if (!quotes.length) return undefined;
+    if (quotes.length!==1) return null;
+    const {replayMsgSeq:seq,replayMsgId:id} = quotes[0].replyElement ?? {};
+    if ([seq,id].some(n=>typeof n==='number' && !Number.isSafeInteger(n))) return null;
+    const hasId = id!=null && String(id)!=='0' && String(id)!=='';
+    let rows;
+    if (/^[1-9]\d{0,18}$/.test(String(seq)) && BigInt(seq)<BigInt(raw.msgSeq)) {
+      rows = await range(BigInt(seq),BigInt(seq));
+    } else if (hasId && /^-?[1-9]\d*$/.test(String(id)) && typeof msgs.getMsgsByMsgId==='function') {
+      const response=await msgs.getMsgsByMsgId(peer,[String(id)]);
+      checkedResult('getMsgsByMsgId',response);
+      rows=(response.msgList??[]).map(raw=>({raw,m:record(raw)}));
+    } else return null;
+    if (rows.length!==1) return null;
+    const {m,raw:quoted}=rows[0];
+    if (!m.fromSelf || BigInt(m.seq)>=BigInt(raw.msgSeq) || (hasId && m.id!==String(id))) return null;
+    const element=quoted.elements.length===1 && quoted.elements[0];
+    const text=element?.textElement?.content;
+    const match=element?.elementType===1 && element.textElement.atType===0 && typeof text==='string' &&
+      /^回复 #([1-9]\d{0,18})\n/.exec(text);
+    if (!match || BigInt(match[1])>=BigInt(m.seq)) return null;
+    const source=await range(BigInt(match[1]),BigInt(match[1]));
+    if (source.length!==1 || promptFor(source[0].raw)===null) return null;
+    const receipt=readJSON('outbox/mention-reply-'+source[0].m.id+'.json');
+    if (!receipt || receipt.groupCode!==binding.id || receipt.digest!==createHash('sha256').update(text).digest('hex') ||
+        (receipt.messageId && receipt.messageId!==m.id)) return null;
+    return {seq:match[1],id:source[0].m.id};
+  }
   function save(next) {
     writeJSON(seenFile, next);
     cursor = next;
@@ -268,6 +306,7 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
         if (observed) {
           receipt.state = found ? 'confirmed' : 'observed_in_group';
           receipt.messageId = observed.m.id;
+          receipt.messageSeq = observed.m.seq;
           receipt.time = observed.m.time;
           break;
         }
@@ -315,12 +354,9 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
           m.id === args.id && m.priority === 'owner' && promptFor(raw) !== null);
         if (matches.length !== 1) throw Error('Reply requires a verified controller mention');
         // Keep the output a single plain text element, even if it contains @ or a command.
-        const prefix = '回复 #' + args.seq + '\n';
-        const suffix = mentionsOnly ? '\n（完整回复见 Windows 上的 Codex 对话）' : '\n（完整回复见 Mac 上的 Codex 对话）';
-        const full = prefix + args.text;
-        const text = full.length <= 4000 ? full :
-          full.slice(0, 4000 - suffix.length).replace(/[\uD800-\uDBFF]$/, '') + suffix;
-        return sendText(text, 'mention-reply-' + args.id, true);
+        const text = replyText(args.seq,args.text);
+        const receipt = await sendText(text, 'mention-reply-' + args.id, true);
+        return {...receipt,publishedText:text.slice(text.indexOf('\n')+1)};
       }
       if (name === 'trigger_page') {
         checkArgs(args, ['after','id']);
@@ -344,6 +380,21 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
             senderUin: String(raw.senderUin), mentionPrompt: promptFor(raw), elements: plain ? [{ elementType: 1,
               textElement: { atType: 0, content: e.textElement.content } }] : [] };
         });
+        if (args.id && result.rows.length===1 && result.rows[0].mentionPrompt!==null) {
+          const source=page.find(({m})=>m.id===args.id);
+          // Unavailable quote history requires a clarification, never a guess using preview text.
+          const quotes=source.raw.elements.filter(e=>e?.elementType===7);
+          if (quotes.length) {
+            try {result.rows[0].quotedTask=await quotedTask(source.raw);}
+            catch {result.rows[0].quotedTask=null;}
+            if (quotes.length===1) {
+              const ref=quotes[0].replyElement ?? {};
+              const exact=n=>n!=null && !(typeof n==='number' && !Number.isSafeInteger(n)) && /^-?[1-9]\d{0,19}$/.test(String(n));
+              result.rows[0].quoteId=exact(ref.replayMsgId)?String(ref.replayMsgId):null;
+              result.rows[0].quoteSeq=exact(ref.replayMsgSeq)?String(ref.replayMsgSeq):null;
+            }
+          }
+        }
         return result;
       }
       if (name === 'read_latest') {

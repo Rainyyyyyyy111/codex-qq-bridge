@@ -40,7 +40,7 @@ node $mentions $qqData enable <本机协同QQ号> <群号> <控制者QQ号>
 node $mentions $qqData dispatch
 ```
 
-`dispatch` 前台运行，首次启动以此时群序号为起点。控制者从 QQ 成员列表点名本机并附上正文，分发器会复核原群历史，创建持久聊天，再把首轮最终回答发回同群。可用环境变量 `QQ_MENTION_PYTHON`、`QQ_MENTION_CODEX` 指定可执行文件。在另一终端执行 `node $mentions $qqData disable` 可撤销该绑定；重新启用或更换群后重新启动群监听器和分发器。旧端须能提供原生群推送、按序号读取历史及群文本发送。仓库的合成测试覆盖这些接口，Windows 真机群环境仍需确认。
+`dispatch` 前台运行，首次启动以此时群序号为起点。控制者从 QQ 成员列表点名本机并附上正文，分发器会复核原群历史，给普通任务新建聊天，遇到原生回复引用或“继续 #42”则续接原聊天。写“基于 #42 的终稿另开”会创建独立聊天。每次只把对应轮次的最终回答发回同群。可用环境变量 `QQ_MENTION_PYTHON`、`QQ_MENTION_CODEX` 指定可执行文件。在另一终端执行 `node $mentions $qqData disable` 可撤销该绑定；重新启用或更换群后重新启动群监听器和分发器。旧端须能提供原生群推送、按序号读取历史及群文本发送。仓库的合成测试覆盖这些接口，Windows 真机群环境仍需确认。
 
 ## 让本机 Codex 接入
 
