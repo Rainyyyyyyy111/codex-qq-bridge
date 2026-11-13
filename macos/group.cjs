@@ -25,16 +25,31 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
   let activeWait = false;
   let lastPollAt, lastError, activePoll;
   let since = readJSON('mention-start-' + binding.id + '.json');
-  function promptFor(raw) {
-    const prompt = mentionPrompt(raw, binding, owner);
+  function promptFor(raw, allowQuote = false) {
+    const prompt = mentionPrompt(raw, binding, owner, allowQuote);
     if (prompt === null || !since || BigInt(raw.msgSeq) <= BigInt(since.seq) || !mentionsEnabled()) return null;
     return readJSON('owner.json')?.uin === owner.uin ? prompt : null;
   }
-  function signal(raw) {
-    if (promptFor(raw) !== null) signalMention(String(raw.msgSeq), String(raw.msgId));
+  async function authorizedPrompt(raw) {
+    const direct = promptFor(raw);
+    if (direct !== null) return direct;
+    const candidate = promptFor(raw, true);
+    return candidate !== null && await quotedTask(raw) ? candidate : null;
+  }
+  async function signal(raw) {
+    try {
+      if (await authorizedPrompt(raw) !== null) signalMention(String(raw.msgSeq), String(raw.msgId));
+    } catch (error) {
+      // Unresolvable quotes must not stall the regular group history cursor.
+      if (promptFor(raw)!==null) throw error;
+    }
   }
   function receive(rows) {
-    if (Array.isArray(rows)) rows.forEach(signal);
+    if (Array.isArray(rows)) for (const raw of rows) {
+      // Keep push-based direct mentions synchronous. History reconciliation retries missed quotes.
+      if (promptFor(raw) !== null) signalMention(String(raw.msgSeq), String(raw.msgId));
+      else if (promptFor(raw,true) !== null) void signal(raw).catch(err=>console.error('Group reply lookup:',err.message));
+    }
   }
   function record(m) {
     if (
@@ -114,10 +129,14 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
       /^回复 #([1-9]\d{0,18})\n/.exec(text);
     if (!match || BigInt(match[1])>=BigInt(m.seq)) return null;
     const source=await range(BigInt(match[1]),BigInt(match[1]));
-    if (source.length!==1 || promptFor(source[0].raw)===null) return null;
-    const receipt=readJSON('outbox/mention-reply-'+source[0].m.id+'.json');
-    if (!receipt || receipt.groupCode!==binding.id || receipt.digest!==createHash('sha256').update(text).digest('hex') ||
-        (receipt.messageId && receipt.messageId!==m.id)) return null;
+    if (source.length!==1 || promptFor(source[0].raw,true)===null) return null;
+    const digest=createHash('sha256').update(text).digest('hex');
+    const matches=['mention-reply-','mention-ack-'].some(prefix=>{
+      const receipt=readJSON('outbox/'+prefix+source[0].m.id+'.json');
+      return receipt && receipt.groupCode===binding.id && receipt.digest===digest &&
+        (!receipt.messageId || receipt.messageId===m.id) && (!receipt.owner || receipt.owner===owner?.uin);
+    });
+    if (!matches) return null;
     return {seq:match[1],id:source[0].m.id};
   }
   function save(next) {
@@ -144,7 +163,7 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
     let seq = cursor.seq;
     for (const { raw, m } of page) {
       if (BigInt(m.seq) < BigInt(seq)) continue;
-      signal(raw);
+      await signal(raw);
       if (!mentionsOnly && !ids.includes(m.id) && m.fromSelf === false) {
         const now = Date.now();
         const event = protocol.receive(
@@ -234,7 +253,7 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
   }
   // A request ID is reserved durably before entering native code. A repeat may
   // inspect its receipt, but can never submit a second message for the same ID.
-  async function sendText(text, requestId, mentionReply = false) {
+  async function sendText(text, requestId, mentionReply = false, immediate = false) {
     validateText(text, requestId);
     const key = 'outbox/' + requestId + '.json';
     const digest = createHash('sha256').update(text).digest('hex');
@@ -251,6 +270,7 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
     const tag = mentionsOnly ? '' : msgs.generateMsgUniqueId(2, session.getMSFService().getServerTime());
     if (!mentionsOnly && (!tag || String(tag) === '0')) throw Error('Could not generate message correlation ID');
     const receipt = {
+      ...(mentionReply ? {owner:owner.uin} : {}),
       requestId,
       groupCode: binding.id,
       digest,
@@ -259,7 +279,7 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
       correlation: String(tag),
     };
     // No await between the second lookup and reservation, even for concurrent calls.
-    if (readJSON(key)) return sendText(text, requestId, mentionReply);
+    if (readJSON(key)) return sendText(text, requestId, mentionReply, immediate);
     if (mentionReply && (!mentionsEnabled() || readJSON('owner.json')?.uin !== owner.uin)) throw Error('Controller binding changed');
     const change = protocol.reserve(
       text,
@@ -276,6 +296,9 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
     checkedResult('sendMsg', result);
     receipt.state = 'accepted';
     writeJSON(key, receipt);
+    // An ACK is immediately quotable via its native echo and durable digest. The
+    // chat receiver need not wait up to 15 seconds for correlated group history.
+    if (immediate) return receipt;
     const until = Date.now() + 15000;
     let nextSeq = BigInt(before.seq) + 1n;
     while (Date.now() < until) {
@@ -343,7 +366,8 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
     }),
     async call(name, args, alive) {
       if (name === 'reply_to_mention') {
-        checkArgs(args, ['seq', 'id', 'text', 'group', 'account', 'owner']);
+        checkArgs(args, ['seq', 'id', 'text', 'group', 'account', 'owner', 'kind']);
+        if (args.kind!==undefined && !['ack','chat'].includes(args.kind)) throw Error('Unknown reply kind');
         if (!owner || args.group !== binding.id || args.account !== self || args.owner !== owner.uin ||
             typeof args.seq !== 'string' || !/^[1-9]\d*$/.test(args.seq) ||
             typeof args.id !== 'string' || !/^-?[1-9]\d*$/.test(args.id) ||
@@ -351,11 +375,11 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
           throw Error('Invalid mention reply or live binding');
         const seq = BigInt(args.seq);
         const matches = (await range(seq, seq)).filter(({ m, raw }) =>
-          m.id === args.id && m.priority === 'owner' && promptFor(raw) !== null);
-        if (matches.length !== 1) throw Error('Reply requires a verified controller mention');
+          m.id === args.id && m.priority === 'owner');
+        if (matches.length !== 1 || await authorizedPrompt(matches[0].raw) === null) throw Error('Reply requires a verified controller mention');
         // Keep the output a single plain text element, even if it contains @ or a command.
         const text = replyText(args.seq,args.text);
-        const receipt = await sendText(text, 'mention-reply-' + args.id, true);
+        const receipt = await sendText(text, (args.kind==='ack'?'mention-ack-':'mention-reply-') + args.id, true, args.kind!==undefined);
         return {...receipt,publishedText:text.slice(text.indexOf('\n')+1)};
       }
       if (name === 'trigger_page') {
@@ -380,13 +404,14 @@ function createGroup(session, binding, readJSON, writeJSON, signalMention = () =
             senderUin: String(raw.senderUin), mentionPrompt: promptFor(raw), elements: plain ? [{ elementType: 1,
               textElement: { atType: 0, content: e.textElement.content } }] : [] };
         });
-        if (args.id && result.rows.length===1 && result.rows[0].mentionPrompt!==null) {
+        if (args.id && result.rows.length===1) {
           const source=page.find(({m})=>m.id===args.id);
           // Unavailable quote history requires a clarification, never a guess using preview text.
           const quotes=source.raw.elements.filter(e=>e?.elementType===7);
-          if (quotes.length) {
+          if (quotes.length && promptFor(source.raw,true)!==null) {
             try {result.rows[0].quotedTask=await quotedTask(source.raw);}
             catch {result.rows[0].quotedTask=null;}
+            if (result.rows[0].quotedTask) result.rows[0].mentionPrompt=promptFor(source.raw,true);
             if (quotes.length===1) {
               const ref=quotes[0].replyElement ?? {};
               const exact=n=>n!=null && !(typeof n==='number' && !Number.isSafeInteger(n)) && /^-?[1-9]\d{0,19}$/.test(String(n));

@@ -80,7 +80,7 @@ if ($readerChanges) { Write-Atomic $readerFile ([Text.UTF8Encoding]::new($false)
 if ($controlChanges) { Write-Atomic $controlFile ([Text.UTF8Encoding]::new($false).GetBytes($controlChanges)) }
 $groupFiles = Join-Path $outputs 'mention-runtime'
 [IO.Directory]::CreateDirectory($groupFiles) | Out-Null
-foreach ($name in 'group.cjs','native.cjs','events.cjs','mention.cjs','mention_routing.py','trigger.py','triggerctl.py','mention_dispatch.py') {
+foreach ($name in 'group.cjs','native.cjs','events.cjs','mention.cjs','group_chat.py','mention_routing.py','trigger.py','triggerctl.py','mention_dispatch.py') {
     Write-Atomic (Join-Path $groupFiles $name) ([IO.File]::ReadAllBytes((Join-Path (Join-Path $PSScriptRoot '../macos') $name)))
 }
 Write-Atomic (Join-Path $outputs 'group-mentions.cjs') ([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'group-mentions.cjs')))

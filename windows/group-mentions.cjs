@@ -93,6 +93,7 @@ async function cli([data,cmd,...args]) {
   }
   if (cmd!=='dispatch') throw Error('Unknown group mention command');
   const env={...process.env,QQ_MENTION_ADAPTER:__filename,QQ_MENTION_NODE:process.execPath,QQ_MENTION_DATA:path.resolve(data),
+    QQ_BRIDGE_COLLAB_STATE:process.env.QQ_BRIDGE_COLLAB_STATE || path.join(path.resolve(data),'collaboration-work'),
     QQ_MENTION_BINDING:configPath(data),QQ_BRIDGE_STATE:cfg.dir,QQ_BRIDGE_ROUTE:'win',PYTHONUTF8:'1'};
   for (const [name,...params] of [['triggerctl.py','arm'],['mention_dispatch.py','--watch']]) {
     const child=spawnSync(process.env.QQ_MENTION_PYTHON||'python',[path.join(runtime,name),...params],{env,stdio:'inherit'});

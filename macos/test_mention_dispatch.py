@@ -35,7 +35,7 @@ class Server:
             return {'thread': {'id': 'real-id', 'turns': [{'items': [item]}]}}
         raise AssertionError(method)
 
-    def wait_turn(self, turn_id):
+    def wait_turn(self, turn_id, poll=None):
         assert turn_id == 'turn1'
         return 'completed'
 
@@ -112,7 +112,9 @@ class MentionDispatchTests(unittest.TestCase):
         wake.mkdir()
         first, second = threading.Event(), threading.Event()
         seen = []
-        def consume(marker):
+        def consume(marker, receive_only=False):
+            if receive_only:
+                return "work"
             if marker.name == '1_11':
                 first.set()
                 self.assertTrue(second.wait(5))

@@ -66,7 +66,7 @@ QQ_BRIDGE_CONNECT_ONLY=1 b status
 
 ```zsh
 b trigger arm && mkdir -p "$qq_state/mention-wake" && \
-  env QQ_BRIDGE_STATE="$qq_state" QQ_BRIDGE_PROFILE="$P" QQ_BRIDGE_ROUTE="acct-$P" \
+  env QQ_BRIDGE_STATE="$qq_state" QQ_BRIDGE_COLLAB_STATE="$work_state" QQ_BRIDGE_PROFILE="$P" QQ_BRIDGE_ROUTE="acct-$P" \
   /usr/bin/python3 -B macos/mention_dispatch.py --watch
 ```
 
@@ -166,11 +166,12 @@ b collab health
 
 ## 3. 第一轮：群内点名、建聊、回群
 
-1. 记一个本轮标记，例如 `G01`。控制者在 QQ 成员列表选中 **Mac 测试号**，随 @ 发送“请只回复 MAC-G01”。再用一条独立消息从列表选中 **Win 测试号**，随 @ 发送“请只回复 WIN-G01”。两端都已启动分发器后再发。每条消息只点名一个号。
-2. 控制者在群中应看到两条新回复，各由被点名的测试号发出。每条首行是 `回复 #原群序号`，次行是对应标记。在两台设备分别核对一个新持久聊天、一个 thread ID，以及聊天首条用户输入、最终答复与群记录相符。Mac 用 M4 的 `b trigger status` 核对 `origin: mention`、`state: dispatched` 和 `replyState`；Win 查 W2 的 `dispatched msg=… thread=…`、`QQ reply … source=…`。保留两条原消息序号和各自的回群序号。
-3. 通过条件为每条原消息恰好建一个聊天、群里能看到一条对应终答。发送回执 `accepted` 只表示本机提交，仍需群内实见。若超时或 `unknown`，先按原消息 ID 查聊天、分发日志和群历史；重发一条 QQ 消息会产生新的任务 ID。
+1. 控制者先 @ **Mac 测试号** 问“冷启动是什么意思？”，再点 QQ 的“回复”引用它的回答，追问“再举一个例子”。Win 测试号重复一遍。核对每端在群里自然作答，另一台不抢答，也没有新建工作聊天。
+2. 给每个账号各派一项需要一点时间的实际工作，例如 `执行：起草一份三段式发布说明，最后一行写 MAC-G01`（Win 换成 `WIN-G01`）。先看到带任务号的登记回执，再看到终稿。收件与终稿各有自己的去重记录。
+3. 任务尚在运行时，引用登记回执先问“到哪一步了？”，再问“刚才说的冷启动为什么重要？”。应能在任务结束前查询已有记录、讨论普通问题。再引用任务回执说“把末行改为 MAC-G02”。若原轮已结束，允许在同一工作对话追加一轮。以终稿实际包含的新标记验收修改；登记回执仅表示桥接收件。
+4. 查 M4 的 `b trigger status`，普通回答应显示 `chatIntent=answer/status`，没有工作 thread ID。任务有持久 thread ID。工作中修改的 `workDelivery=accepted` 表示原轮次接收，`next` 表示另排原聊天的下一轮，`uncertain` 需核对原记录。Win 可用 W2 分发日志、群内查询和 Codex 里的工作聊天核对。另用“基于 #任务序号 的终稿另开，写一句标题”检查派生任务。
 
-要在真机核对续聊，可在每端各自的 `G01` 回群答复上用 QQ 的“回复”，从成员列表 @ 同一设备，要求“把刚才的标记加上 -V2”。核对聊天 ID 与原任务相同、轮次 ID 不同且只有一条新答复。再 @ 该设备并写“基于 #原任务序号 的终稿另开，写一句标题”，应得到新聊天，参考稿是被指定的版本。同时给出互相矛盾的编号和引用时，群里应收到澄清问题。
+只更新联调实例时，两端先在联调仓库运行 `git pull --ff-only`。Mac 前台运行的测试 native worker、群分发器分别从更新后的源码重新启动。Win 对独立测试监听器副本重新执行安装脚本并重启测试 reader、分发器。沿用原测试账号和目录，不必重新初始化。Win 如用自选协作目录，在 W2 启动分发器前设置 `$env:QQ_BRIDGE_COLLAB_STATE=$workState`。
 
 ## 4. 第二轮：Mac 发起，Windows 供稿并校稿
 

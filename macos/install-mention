@@ -24,7 +24,7 @@ from pathlib import Path
 plist, runtime, state, label = sys.argv[1:]
 config = dict(Label=label, ProgramArguments=['/usr/bin/python3', str(Path(runtime)/'mention_dispatch.py')],
               QueueDirectories=[str(Path(state)/'mention-wake')], ThrottleInterval=5,
-              EnvironmentVariables={'PATH':os.environ['PATH'], 'QQ_BRIDGE_STATE':state, 'QQ_BRIDGE_ROUTE':os.environ['QQ_BRIDGE_ROUTE'], 'QQ_BRIDGE_PROFILE':os.environ['QQ_BRIDGE_PROFILE']},
+              EnvironmentVariables={'PATH':os.environ['PATH'], 'QQ_BRIDGE_STATE':state, 'QQ_BRIDGE_COLLAB_STATE':os.environ['QQ_BRIDGE_COLLAB_STATE'], 'QQ_BRIDGE_ROUTE':os.environ['QQ_BRIDGE_ROUTE'], 'QQ_BRIDGE_PROFILE':os.environ['QQ_BRIDGE_PROFILE']},
               StandardOutPath=str(Path(state)/'mention.log'), StandardErrorPath=str(Path(state)/'mention.log'))
 dest = Path(plist)
 data = plistlib.dumps(config)

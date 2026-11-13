@@ -10,6 +10,10 @@ ASK = "请再 @ 我，引用要继续的那条回群答复，或写「继续 #�
 
 
 def install_schema(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS group_chat (
+        msg_id TEXT PRIMARY KEY, intent TEXT NOT NULL, focus_id TEXT, reply TEXT NOT NULL,
+        ack_state TEXT, delivery TEXT, work_turn TEXT, activity TEXT)""")
+    db.execute("CREATE INDEX IF NOT EXISTS group_chat_turn ON group_chat(work_turn,delivery)")
     db.execute("""CREATE TABLE IF NOT EXISTS mention_turns (
         msg_id TEXT PRIMARY KEY, action TEXT NOT NULL, root_id TEXT NOT NULL, source_id TEXT,
         clarification_id TEXT, turn_id TEXT, previous_turn TEXT, submitted TEXT, final TEXT, published TEXT, reply_id TEXT, reply_seq TEXT)""")
@@ -42,7 +46,7 @@ def quoted_task(q, row):
     return stored(q, native_key) if native_key else None
 
 
-def plan(q, key, row):
+def plan(q, key, row, conversational=False):
     """Freeze the routing decision before touching Codex; repeat delivery reads the same plan."""
     with q.transaction():
         task = stored(q, key)
@@ -53,7 +57,7 @@ def plan(q, key, row):
         clause = re.split(r"[，,。；;：:\n]", text, maxsplit=1)[0]
         fork = bool(FORK.search(clause) or re.search(r"[，,。；;]\s*(?:请)?另开", text))
         explicit = bool(DIRECTIVE.match(clause) or fork or re.match(r"^[#＃]\s*[0-9]+\s*(?:继续|另开)", clause))
-        refs = set(NUMBER.findall(clause)) if explicit else set()
+        refs = set(NUMBER.findall(clause)) if explicit or NUMBER.match(clause) or re.search(r"进度|到哪|怎么样|状态", clause) else set()
         # Accept “另开，基于 #42 …” and detect contradictory subsequent routing clauses.
         for following in re.split(r"[，,。；;：:\n]", text)[1:]:
             if DIRECTIVE.match(following):
@@ -81,7 +85,7 @@ def plan(q, key, row):
                 # trigger sync may have observed the source before its wake worker planned it.
                 # Its own native quote metadata must be read before deriving our root.
                 raise RuntimeError("Referenced group task is awaiting routing")
-        elif refs or MISSING_REF.match(text) or (fork and re.search(r"上[一次个版]|刚才|之前|原稿|该稿", clause)):
+        elif refs or (not conversational and MISSING_REF.match(text)) or (fork and re.search(r"上[一次个版]|刚才|之前|原稿|该稿", clause)):
             ambiguous = True
         if clarification:
             ambiguous |= source is None
@@ -90,7 +94,7 @@ def plan(q, key, row):
                 # Its own native quote metadata must be read before deriving our root.
                 raise RuntimeError("Referenced group task is awaiting routing")
             fork |= bool(FORK.search(clarification["body"].split("，", 1)[0]))
-        if source:
+        if source and not conversational:
             ambiguous |= source["action"] == "clarify" or source["state"] in ("uncertain", "failed")
             ambiguous |= source["state"] == "dispatched" and not source["reply_state"]
         if ambiguous:

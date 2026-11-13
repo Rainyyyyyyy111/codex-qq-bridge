@@ -9,7 +9,7 @@ const {configuration,enable,startMentions}=require('./group-mentions.cjs');
 const {request}=require('./paired-dm.cjs');
 const mac=path.join(__dirname,'../macos'), adapter=path.join(__dirname,'group-mentions.cjs');
 const python=process.platform==='win32'?'python':'python3';
-const prompt=' 写一份周报\n保留第二行';
+const prompt=' 执行：写一份周报\n保留第二行';
 const plain=content=>({elementType:1,textElement:{atType:0,content}});
 function row(seq,owner='303',mentioned=true){
   const elements=mentioned?[{elementType:1,textElement:{atType:2,atNtUid:'u_101',content:'@设备'}},plain(prompt)]:[plain('@设备'+prompt)];
@@ -92,8 +92,9 @@ for(const route of ['mac','win']) {
     }
     await until(()=>fs.existsSync(log) && !fs.existsSync(marker),'completed final reply '+errors);
     const replies=messages();
-    assert.equal(replies.length,1,errors);assert.equal(replies[0].to,'900');
-    assert.equal(replies[0].text,'回复 #4\n已完成：'+prompt);
+    assert.equal(replies.length,2,errors);assert.ok(replies.every(r=>r.to==='900'));
+    assert.match(replies[0].text,/已登记/);
+    assert.equal(replies[1].text,'回复 #4\n已完成：'+prompt);
     assert.equal(fs.readFileSync(log,'utf8'),'created'+os.EOL);
     assert.deepEqual(fs.readdirSync(path.join(state,'mention-wake')),[]);
     if(route==='win'){

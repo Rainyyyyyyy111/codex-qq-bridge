@@ -1,4 +1,4 @@
-"""Run an authenticated QQ mention locally and return its final answer to the bound group."""
+"""Dispatch verified group conversations independently of persistent local work threads."""
 import hashlib
 import json
 import os
@@ -13,10 +13,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 
 from mention_routing import ASK, plan, stored
+from group_chat import WORK, prepare_chat, desk_row
 from trigger import TriggerQueue
 from triggerctl import ROUTE, STATE, bridge_call, history
 
@@ -26,9 +28,17 @@ REVIEW = STATE / "mention-review"
 MARKER = re.compile(r"([1-9][0-9]*)_(-?[1-9][0-9]*)")
 
 
+def codex_cli():
+    return os.environ.get("QQ_MENTION_CODEX") or (CODEX if CODEX.is_file() else shutil.which("codex"))
+
+
+class RpcRejected(RuntimeError):
+    pass
+
+
 class AppServer:
     def __enter__(self):
-        cli = os.environ.get("QQ_MENTION_CODEX") or (CODEX if CODEX.is_file() else shutil.which("codex"))
+        cli = codex_cli()
         if not cli:
             raise FileNotFoundError("Codex CLI not found")
         profile = os.environ.get("QQ_BRIDGE_PROFILE", "default")
@@ -40,6 +50,7 @@ class AppServer:
         )
         self.incoming = Queue()
         self.completed = {}
+        self.activity = None
         self.serial = 0
         threading.Thread(target=self._read, daemon=True).start()
         try:
@@ -55,7 +66,7 @@ class AppServer:
         try:
             for line in self.proc.stdout:
                 msg = json.loads(line)
-                if "id" in msg or msg.get("method") == "turn/completed":
+                if "id" in msg or msg.get("method") in ("turn/completed","item/started","item/completed"):
                     self.incoming.put(msg)
         finally:
             self.incoming.put(None)
@@ -74,6 +85,9 @@ class AppServer:
         if msg.get("method") == "turn/completed":
             turn = msg["params"]["turn"]
             self.completed[turn["id"]] = turn["status"]
+        elif msg.get("method") in ("item/started", "item/completed"):
+            if self.activity:
+                self.activity(msg)
         elif "method" in msg and "id" in msg:
             # This unattended client has no human approval or interactive input channel.
             self.send({"id": msg["id"], "error": {"code": -32601, "message": "Interactive request unavailable"}})
@@ -88,14 +102,16 @@ class AppServer:
             msg = self.next(deadline)
             if msg and msg.get("id") == self.serial:
                 if "error" in msg:
-                    raise RuntimeError(f"{method}: {msg['error'].get('message', 'RPC failed')}")
+                    raise RpcRejected(f"{method}: {msg['error'].get('message', 'RPC failed')}")
                 return msg["result"]
 
-    def wait_turn(self, turn_id):
+    def wait_turn(self, turn_id, poll=None):
         while turn_id not in self.completed:
             # Quiet long-running jobs are allowed to finish.
             try:
-                self.next(time.monotonic() + 600)
+                if poll:
+                    poll()
+                self.next(time.monotonic() + (0.35 if poll else 600))
             except TimeoutError:
                 if self.proc.poll() is not None:
                     raise
@@ -226,6 +242,58 @@ def prior_material(server, q, task):
     raise ValueError("Published source text unavailable")
 
 
+def steer_pending(server, q, root_id, thread_id, turn_id):
+    row = q.db.execute("""SELECT c.msg_id,t.body FROM group_chat c JOIN tasks t USING(msg_id)
+        JOIN mention_turns m USING(msg_id) WHERE m.root_id=? AND c.delivery='queued'
+        ORDER BY t.seq LIMIT 1""", (root_id,)).fetchone()
+    if not row:
+        return
+    key, body = row
+    q.db.execute("UPDATE group_chat SET delivery='sending',work_turn=? WHERE msg_id=?", (turn_id,key))
+    client_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"qq:{q.account}/{q.group}/{key}"))
+    try:
+        reply = server.call("turn/steer", {"threadId":thread_id,"expectedTurnId":turn_id,
+                            "clientUserMessageId":client_id, "input":[{"type":"text","text":body,"text_elements":[]}]})
+        if reply.get("turnId") != turn_id:
+            raise ValueError("Work turn changed")
+    except RpcRejected:
+        # An explicit rejection did not apply this input. Run it as the next normal turn.
+        q.db.execute("UPDATE group_chat SET delivery='next' WHERE msg_id=?", (key,))
+        return
+    except (OSError, RuntimeError, ValueError):
+        q.db.execute("UPDATE group_chat SET delivery='uncertain' WHERE msg_id=?", (key,))
+        return
+    with q.transaction():
+        q.db.execute("UPDATE group_chat SET delivery='accepted' WHERE msg_id=?", (key,))
+        q.db.execute("UPDATE tasks SET state='dispatched',host='local',thread_id=?,reply_state='steered' WHERE msg_id=?",
+                     (thread_id,key))
+        q.db.execute("UPDATE mention_turns SET turn_id=? WHERE msg_id=?", (turn_id,key))
+
+
+def reconcile_steer(q, task, turn_id):
+    owner = q.db.execute("SELECT thread_id FROM tasks JOIN mention_turns USING(msg_id) WHERE turn_id=? AND thread_id IS NOT NULL LIMIT 1",
+                         (turn_id,)).fetchone()
+    if not owner:
+        return False
+    key = task["msg_id"]
+    expected = str(uuid.uuid5(uuid.NAMESPACE_URL, f"qq:{q.account}/{q.group}/{key}"))
+    with AppServer() as server:
+        turns = read_thread(server, owner[0])["turns"]
+    found = any(item.get("type")=="userMessage" and item.get("id")==expected
+                for turn in turns if turn.get("id")==turn_id for item in turn["items"])
+    if found:
+        with q.transaction():
+            q.db.execute("UPDATE group_chat SET delivery='accepted' WHERE msg_id=?", (key,))
+            q.db.execute("UPDATE tasks SET state='dispatched',host='local',thread_id=?,reply_state='steered' WHERE msg_id=?",
+                         (owner[0],key))
+            q.db.execute("UPDATE mention_turns SET turn_id=? WHERE msg_id=?", (turn_id,key))
+    return found
+
+
+ACTIVITY = {"commandExecution":"运行本机命令", "fileChange":"处理文件修改", "webSearch":"检索资料",
+            "mcpToolCall":"调用工具", "collabAgentToolCall":"协调子任务"}
+
+
 def dispatch(server, q, key, cwd):
     task = stored(q, key)
     if task["state"] != "pending":
@@ -276,26 +344,47 @@ def dispatch(server, q, key, cwd):
     q.db.execute("UPDATE mention_turns SET turn_id=? WHERE msg_id=?", (turn_id, key))
     if task["action"] != "resume":
         server.call("thread/name/set", {"threadId": thread_id, "name": claim[1]["title"]})
-    status = server.wait_turn(turn_id)
+    def record_activity(event):
+        params = event.get("params", {})
+        label = ACTIVITY.get(params.get("item", {}).get("type"))
+        if label and params.get("turnId") == turn_id:
+            q.db.execute("UPDATE group_chat SET activity=? WHERE msg_id=?",
+                         (label + ("已结束" if event["method"]=="item/completed" else "已开始"),key))
+    server.activity = record_activity
+    try:
+        status = server.wait_turn(turn_id, lambda: steer_pending(server,q,task["root_id"],thread_id,turn_id))
+    finally:
+        server.activity = None
     if status != "completed":
         raise ValueError("QQ work turn ended: " + str(status))
     print(f"turn {status} msg={key} thread={thread_id} turn={turn_id}", flush=True)
 
 
+def send_group(q, task, answer, ack=False):
+    key = task["msg_id"]
+    args = {"seq":str(task["seq"]), "id":key, "group":q.group, "owner":q.owner, "account":q.account,
+            "text":answer[:4001]}
+    if ack:
+        args["kind"] = "ack"
+    elif task["action"] in ("chat","clarify"):
+        args["kind"] = "chat"
+    receipt = bridge_call("reply_to_mention", args)
+    prefix = "mention-ack-" if ack else "mention-reply-"
+    if receipt.get("requestId") != prefix + key or receipt.get("groupCode") != q.group:
+        raise ValueError("QQ reply receipt identity mismatch")
+    return receipt
+
+
 def publish(q, task, answer):
     key = task["msg_id"]
-    receipt = bridge_call("reply_to_mention", {
-        "seq": str(task["seq"]), "id": key, "group": q.group, "owner": q.owner, "account": q.account,
-        "text": answer[:4001],
-    })
-    if receipt.get("requestId") != "mention-reply-" + key or receipt.get("groupCode") != q.group:
-        raise ValueError("QQ reply receipt identity mismatch")
+    receipt = send_group(q, task, answer)
     status = receipt.get("state")
     if status not in ("accepted", "confirmed", "observed_in_group", "unknown"):
         raise ValueError("Unexpected QQ reply receipt")
     with q.transaction():
-        if task["action"] == "clarify":
-            q.db.execute("UPDATE tasks SET state='clarified' WHERE msg_id=?", (key,))
+        if task["action"] in ("clarify","chat"):
+            q.db.execute("UPDATE tasks SET state=? WHERE msg_id=?",
+                         ("clarified" if task["action"]=="clarify" else "answered", key))
         q.db.execute("UPDATE tasks SET reply_state=? WHERE msg_id=?", (status, key))
         q.db.execute("UPDATE mention_turns SET reply_id=?,reply_seq=?,published=? WHERE msg_id=?",
                      (receipt.get("messageId"), receipt.get("messageSeq"), receipt.get("publishedText"), key))
@@ -337,6 +426,14 @@ def deliver(server, q, key):
             q.db.execute("UPDATE tasks SET state='dispatched' WHERE msg_id=?", (key,))
             q.db.execute("UPDATE mention_turns SET final=? WHERE msg_id=?", (answer, key))
         print(f"dispatched msg={key} thread={task['thread_id']}", flush=True)
+    with q.transaction():
+        waiting = q.db.execute("""SELECT 1 FROM group_chat c JOIN mention_turns m USING(msg_id)
+            JOIN tasks t USING(msg_id) WHERE m.root_id=? AND t.seq>? AND t.state='pending'
+            AND c.intent='resume' AND coalesce(c.delivery,'next') IN ('queued','next') LIMIT 1""",
+                               (task["root_id"],task["seq"])).fetchone()
+        if waiting:
+            q.db.execute("UPDATE tasks SET reply_state='superseded' WHERE msg_id=?", (key,))
+            return
     publish(q, task, answer)
 
 
@@ -360,14 +457,50 @@ def verified_mention(marker):
         entry = stored(q, key)
         if not entry or (entry["seq"], entry["body"]) != (int(seq), row["mentionPrompt"]):
             raise ValueError("Durable task differs from native mention")
-        yield q, plan(q, key, row)
+        yield q, plan(q, key, row, conversational=True)
     finally:
         q.db.close()
+
+
+def reception(marker):
+    """Classify and answer on a dedicated lane even when all work slots are occupied."""
+    with verified_mention(marker) as (q, task):
+        key = task["msg_id"]
+        existing = desk_row(q,key)
+        if not existing and task["state"] != "pending":
+            return True  # pre-upgrade task, preserve its original delivery contract
+        prepare_chat(q, task, codex_cli())
+        task = stored(q,key)
+        intent, focus, text, ack, delivery, _ = desk_row(q,key)
+        if intent not in WORK:
+            if task["reply_state"] == "pending":
+                publish(q,task,text)
+            return False
+        if intent == "resume" and delivery is None and not task["clarification_id"]:
+            with q.transaction():
+                active = q.db.execute("""SELECT t.msg_id FROM tasks t JOIN mention_turns m USING(msg_id)
+                    WHERE m.root_id=? AND t.state='verifying' AND m.turn_id IS NOT NULL
+                    ORDER BY t.seq DESC LIMIT 1""", (task["root_id"],)).fetchone()
+                if active:
+                    q.db.execute("UPDATE group_chat SET delivery='queued' WHERE msg_id=?", (key,))
+        if not ack:
+            receipt = send_group(q,task,text,ack=True)
+            q.db.execute("UPDATE group_chat SET ack_state=? WHERE msg_id=?", (receipt["state"],key))
+        # A second marker for an already completed turn does not acquire any work capacity.
+        if task["state"] == "dispatched" and task["reply_state"] in ("accepted","observed_in_group","confirmed","steered","superseded"):
+            return False
+        # The active worker polls this input itself. The scheduler handles a missed turn on completion.
+        return True
 
 
 def handle(marker):
     with verified_mention(marker) as (q, task):
         key, reply = task["msg_id"], task["reply_state"]
+        entry = desk_row(q,key)
+        if entry and entry[4] in ("accepted","sending","uncertain"):
+            if entry[4] != "accepted" and not reconcile_steer(q,task,entry[5]):
+                raise ValueError("Steering delivery needs reconciliation; will not resubmit")
+            return
         if reply == "unknown" or task["state"] in ("creating", "uncertain", "failed"):
             raise ValueError("Task or group reply requires manual review")
         if task["state"] in ("dispatched", "clarified") and reply != "pending":
@@ -379,6 +512,7 @@ def handle(marker):
         if task["source_id"]:
             source = stored(q, task["source_id"])
             if (source["state"] in ("failed", "uncertain", "clarified") or source["reply_state"] == "unknown" or
+                    (task["action"] == "fork" and source["reply_state"] in ("superseded","steered")) or
                     (source["reply_state"] == "pending" and (REVIEW / (str(source["seq"])+"_"+source["msg_id"])).is_file())):
                 if task["state"] == "pending":
                     q.db.execute("UPDATE mention_turns SET action='clarify' WHERE msg_id=?", (key,))
@@ -405,12 +539,16 @@ def handle(marker):
             deliver(server, q, key)
 
 
-def process(marker):
+def process(marker, receive_only=False):
     # Retry read-only operations and pending jobs. A creating job is never created again.
     for delay in (0, 2, 5, 15, 30, 60):
         time.sleep(delay)
         try:
-            handle(marker)
+            if receive_only:
+                if reception(marker):
+                    return "work"
+            else:
+                handle(marker)
             marker.unlink(missing_ok=True)
             return
         except ThreadBusy:
@@ -443,41 +581,40 @@ def main():
         watch_directory()
 
 
-def schedule(active, pool, plans, notify=None):
-    # Freeze plans in native sequence order before submitting concurrent jobs.
-    # Only one worker at a time owns a conversation, including during reply publication.
+def schedule(active, work_pool, chat_pool, plans, notify=None):
     for marker in list(active):
-        if active[marker][0].done():
-            active.pop(marker)[0].result()
-    occupied = {root for _, root in active.values()}
+        future, lane = active[marker]
+        if future.done():
+            del active[marker]
+            if future.result() == "work":
+                plans[marker] = "work"
+    occupied = {lane for _,lane in active.values()}
     for marker in list(plans):
         if not marker.exists():
             del plans[marker]
     markers = sorted(WAKE.iterdir(), key=lambda p: int(p.name.split("_")[0]) if MARKER.fullmatch(p.name) else 0)
     for marker in markers:
-        if marker in active or len(active) >= 4:
+        if marker in active:
             continue
-        try:
-            if marker not in plans:
+        if marker not in plans:
+            if "chat" in occupied:
+                continue
+            lane = "chat"
+            future = chat_pool.submit(process, marker, True)
+        else:
+            if len(occupied - {"chat"}) >= 4:
+                continue
+            try:
                 with verified_mention(marker) as (_, task):
-                    plans[marker] = (task["root_id"], task["source_id"])
-            root, parent = plans[marker]
-        except (OSError, sqlite3.Error, ValueError, RuntimeError):
-            # process() performs the bounded retry and preserves a failed marker for review.
-            root = marker.name
-            # An unresolved earlier marker may address any conversation.
-            if active:
-                break
-            future = pool.submit(process, marker)
-            active[marker] = future, root
-            if notify:
-                future.add_done_callback(notify)
-            break
-        if root in occupied or (parent and any(p.name.endswith("_" + parent) for p in active)):
-            continue
-        future = pool.submit(process, marker)
-        active[marker] = future, root
-        occupied.add(root)
+                    lane = task["root_id"]
+                    parent = task["source_id"]
+            except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                lane, parent = marker.name, None
+            if lane in occupied or (parent and any(p.name.endswith("_"+parent) for p in active)):
+                continue
+            future = work_pool.submit(process, marker)
+        active[marker] = future, lane
+        occupied.add(lane)
         if notify:
             future.add_done_callback(notify)
 
@@ -487,7 +624,7 @@ def watch_directory():
     # immediately, including while an earlier chat is still working.
     if os.name == "nt" or "--watch" in sys.argv:
         # Windows group mode is supervised by the foreground dispatcher command.
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool, ThreadPoolExecutor(max_workers=1) as chat:
             active, plans = {}, {}
             while True:
                 binding = os.environ.get("QQ_MENTION_BINDING")
@@ -495,19 +632,19 @@ def watch_directory():
                     cfg = json.loads(Path(binding).read_text(encoding="utf-8"))
                     if not cfg or hashlib.sha256(cfg["token"].encode()).hexdigest()[:24] != STATE.name:
                         return
-                schedule(active, pool, plans)
+                schedule(active, pool, chat, plans)
                 time.sleep(0.25)
     directory = os.open(WAKE, os.O_RDONLY)
     active, plans = {}, {}
     reader, writer = socket.socketpair()
     try:
-        with closing(select.kqueue()) as events, reader, writer, ThreadPoolExecutor(max_workers=4) as pool:
+        with closing(select.kqueue()) as events, reader, writer, ThreadPoolExecutor(max_workers=4) as pool, ThreadPoolExecutor(max_workers=1) as chat:
             changes = [select.kevent(directory, filter=select.KQ_FILTER_VNODE,
                                      flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=select.KQ_NOTE_WRITE),
                        select.kevent(reader.fileno(), filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)]
             events.control(changes, 0, 0)
             while True:
-                schedule(active, pool, plans, lambda _: writer.send(b'x'))
+                schedule(active, pool, chat, plans, lambda _: writer.send(b'x'))
                 if not active:
                     return
                 for event in events.control(None, 2):
