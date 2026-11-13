@@ -125,6 +125,14 @@ echo '{"request_id":"review-restart-1","task":"核对跨端重启后会不会重
 
 删除 `collaborationContact` 后，后台会拒绝新的协作收发。再次执行安装会移除本账号的协作 LaunchAgent 和独立 MCP。任务、协作私聊游标和回执保存在各自账号的本地状态目录。仅切换联系对象时，请给新配对单独的账号配置或状态目录，避免混用尚在进行的任务。
 
+## 群内点名建聊
+
+先为所选账号安装本版桥接，配置 `owner.json` 中的人类控制者 QQ 号，并确认绑定群就绪。在仓库的 `macos/` 中运行 `./bridge mention-enable`；具名账号使用 `./bridge --profile lab mention-enable`。该命令按本账号建立任务队列并启用目录唤醒的 LaunchAgent。已有本机旧版的任务、回群回执和默认目录沿用原记录。
+
+控制者从 QQ 成员列表选择这个账号，随 @ 附上任务。例如“@Mac协同号 请整理今天的决定”。本机核对原生群号、发送者和 @ 目标，按原文建持久聊天。首轮结束后再查该轮的最终答复，回到原群并标明“回复 #群序号”。进度和后续聊天内容留在本机。长答复在群里显示节选。群消息 ID 是建聊和回群的去重依据。
+
+用 `./bridge trigger status` 核对条目的 `origin`、`state` 与 `replyState`；发送结果不明时保留原回执供核对。要单独暂停 @ 分发，执行相同 profile 的 `mention-disable`。原有 `/task` 桌面调度继续领取自己的任务。
+
 ## 群消息、事件与桌面任务
 
 桌面任务只把本条指令的正文交给新聊天，完整的 `/task` 指令最多 16,000 个 UTF-16 码元。群读工具和联系人私聊读工具每次返回一条，每条的 `elements` 数组按实际 JSON 的 UTF-8 编码最多 8 KiB，超出时结果带有 `truncated: true`。协议校验和发送回读使用原始消息。群后台的待领队列与 Codex 聊天记录分别保存；在同一聊天里连续调用工具时，先前的工具结果仍属于该聊天。
@@ -133,7 +141,7 @@ echo '{"request_id":"review-restart-1","task":"核对跨端重启后会不会重
 - send_text 使用独立的 request_id。accepted 表示原生接口接受，confirmed 表示在绑定群回读匹配到关联 ID，observed_in_group 表示回读匹配了含唯一请求号的正文。繁忙群的回读可以继续到后续历史页。
 - 两个协同端可使用两行协议。第一行是 `QQCOOP/1 REQUEST|DONE|FAILED UUIDv4 收件QQ号`，第二行起是工作内容。收件号码、原生 senderUin 和事件号均须匹配。REQUEST 可在本地授权后回一次 DONE 或 FAILED。到期或收到终态即结案。群消息里的收件号是协议路由，群内发信仍对群成员可见。
 - 要开启建聊，在本机对应状态目录配置 owner.json，例如 `{"uin":"303"}`，填写真实的人类控制者 QQ 号并重启该后台。默认账号执行 `./bridge trigger arm`，lab 账号执行 `./bridge --profile lab trigger arm`，保存启用时的群序号。按 dispatcher.md 在 Codex 桌面配置该账号自己的定时调度，固定命令路径和配置名。实际运行取决于 Codex 桌面调度；安装桥接服务与启用建聊是两个步骤。
-- 只有原生 senderUin 命中控制者、单个普通文本元素且无 @ 的记录可触发。支持 `/task mac /task acct-lab 正文`。群内其他账号、引用与转发不能建聊。SQLite 认领后核对 host/thread ID 与首条任务。创建结果不明时保留原记录供核对。
+- 对于 `/task` 路由，只有原生 senderUin 命中控制者、单个普通文本元素且无 @ 的记录可触发。支持 `/task mac /task acct-lab 正文`。群内其他账号、引用与转发不能建聊。SQLite 认领后核对 host/thread ID 与首条任务。创建结果不明时保留原记录供核对。
 - 使用 `./bridge --profile lab trigger status` 查某个账号的进度。要暂停建聊，暂停对应桌面调度。群和私聊的普通收件都不会自动回信。
 
 ## 排错和停用

@@ -103,7 +103,7 @@ async function serve(options) {
       const version=pulse.version, job=ready && engine.claim();
       if(!job){await pulse.wait(version,5000);continue;}
       pulse.fire();
-      const method={drafting:'draft',reviewing:'review',revising:'revise'}[job.phase];
+      const method=job.mode==='write' ? {drafting:'plan',reviewing:'contribute',revising:'synthesize',checking:'check'}[job.phase] : {drafting:'draft',reviewing:'review',revising:'revise'}[job.phase];
       try{
         let result;
         for(;;){
@@ -155,7 +155,10 @@ async function serve(options) {
       return rpc('dm_send',{expected,request_id:args.request_id,text:args.text});
     }
     let id;
-    if(name==='submit'||name==='start')id=engine.start(args,name==='start');
+    if(name==='write'){
+      if((args.lead===undefined)!==(args.assignment===undefined))throw Error('Supply both lead and assignment');
+      id=engine.start(args,args.lead===undefined,'write');
+    } else if(name==='submit'||name==='start')id=engine.start(args,name==='start');
     else if(name==='note'){id=args.id;engine.note(id,args.text,args.request_id);}
     else throw Error('Unknown collaboration command');
     pulse.fire();return {id,phase:engine.status(id).phase};
@@ -224,7 +227,7 @@ async function main(){
     return serve(opts);
   }
   let input={};
-  if(['submit','start','note','peer-send'].includes(cmd)){
+  if(['submit','start','write','note','peer-send'].includes(cmd)){
     let buf='';process.stdin.setEncoding('utf8');for await(const chunk of process.stdin){buf+=chunk;if(buf.length>12000)throw Error('Local request too large');}
     input=JSON.parse(buf);if(!input||Array.isArray(input)||typeof input!=='object')throw Error('Expected JSON object');
   }else if(!['status','wait','listen','health','peer-read'].includes(cmd))throw Error('Unknown collaboration command');

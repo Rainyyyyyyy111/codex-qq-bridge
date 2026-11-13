@@ -5,7 +5,8 @@ $watcher = (Resolve-Path -LiteralPath (Join-Path $outputs 'qq-target-watch.cjs')
 $source = [IO.File]::ReadAllText($watcher)
 $signature = 'function watch({session, callbacks, self, target, dataDir, ready}) {'
 $installed = $source.Contains("require('./paired-dm.cjs').startPairedDm(")
-if (!$installed -and ([regex]::Matches($source, [regex]::Escape($signature))).Count -ne 1) {
+$mentionsInstalled = $source.Contains("require('./group-mentions.cjs').startMentions(")
+if ((!$installed -or !$mentionsInstalled) -and ([regex]::Matches($source, [regex]::Escape($signature))).Count -ne 1) {
     throw 'Expected one supported QQ watcher entry. Inspect the local watcher before installing.'
 }
 function Write-Atomic([string]$target, [byte[]]$bytes) {
@@ -77,6 +78,16 @@ foreach ($name in 'paired-dm.cjs','dm-only.cjs','dm-host.ps1','dm-login.html') {
 }
 if ($readerChanges) { Write-Atomic $readerFile ([Text.UTF8Encoding]::new($false).GetBytes($readerChanges)) }
 if ($controlChanges) { Write-Atomic $controlFile ([Text.UTF8Encoding]::new($false).GetBytes($controlChanges)) }
+$groupFiles = Join-Path $outputs 'mention-runtime'
+[IO.Directory]::CreateDirectory($groupFiles) | Out-Null
+foreach ($name in 'group.cjs','native.cjs','events.cjs','mention.cjs','trigger.py','triggerctl.py','mention_dispatch.py') {
+    Write-Atomic (Join-Path $groupFiles $name) ([IO.File]::ReadAllBytes((Join-Path (Join-Path $PSScriptRoot '../macos') $name)))
+}
+Write-Atomic (Join-Path $outputs 'group-mentions.cjs') ([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'group-mentions.cjs')))
+if (!$mentionsInstalled) {
+    $hook = "  void require('./group-mentions.cjs').startMentions({session,callbacks,self,dataDir}).catch(err=>console.error('Group mentions:',err.message));"
+    $source = $source.Replace($signature,$signature + [Environment]::NewLine + $hook)
+}
 if (!$installed) {
     $hook = @'
   void require('./paired-dm.cjs').startPairedDm({session,callbacks,self,dataDir,onReady:ready,onOffline:()=>process.exit(4),
@@ -84,6 +95,9 @@ if (!$installed) {
 '@
     $newline = if ($source.Contains("`r`n")) { "`r`n" } else { "`n" }
     $updated = $source.Replace($signature, $signature + $newline + ($hook -replace "\r?\n",$newline))
-    Write-Atomic $watcher ([Text.UTF8Encoding]::new($false).GetBytes($updated))
+    $source = $updated
 }
-Write-Output "Paired DM adapter installed in $outputs"
+if (!$installed -or !$mentionsInstalled) {
+    Write-Atomic $watcher ([Text.UTF8Encoding]::new($false).GetBytes($source))
+}
+Write-Output "Paired DM and group mention adapters installed in $outputs"

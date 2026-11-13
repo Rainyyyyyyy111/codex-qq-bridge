@@ -38,12 +38,13 @@ function setup() {
       };
     },
   };
-  function start() {
+  function start(signal) {
     return createGroup(
       { getMsgService: () => service, getMSFService: () => ({ getServerTime: () => 1000 }) },
       binding,
       (k) => db.get(k),
       (k, v) => db.set(k, v),
+      signal,
     );
   }
   return { service, rows, message, start, db };
@@ -211,4 +212,86 @@ test('send confirmation advances past the first native page on a busy group', as
   const result = await group.call('send_text', { text: 'test', request_id: 'busy' });
   assert.equal(result.state, 'confirmed');
   assert.deepEqual(starts, ['2', '34', '66']);
+});
+
+test('native push and scoped history require a controller mention of this account', async () => {
+  const t = setup();
+  t.db.set('owner.json', { uin: '500' });
+  const g = t.start();
+  await g.initialize();
+  const text = { elementType: 1, textElement: { content: '/task mac t', atType: 0 } };
+  const row = (n, elements, senderUin = '500') => ({ ...t.message(n), senderUin, elements });
+  t.rows.push(row(2, [text]), row(3, [text, { elementType: 7 }]),
+    row(4, [{ ...text, textElement: { ...text.textElement, atType: 2 } }]), row(5, [text], '501'));
+  const addressed = { elementType: 1, textElement: { atType: 2, atNtUid: 'self' } };
+  t.rows.push(row(6, [addressed, text]));
+  const page = await g.call('trigger_page', { after: '1' });
+  assert.equal(page.account, '456');
+  assert.deepEqual(page.rows.map(x => x.mentionPrompt), [null, null, null, null, text.textElement.content]);
+  assert.equal(g.status().seq, '1');
+  await assert.rejects(g.call('trigger_page', { group: 'other' }), /Unexpected/);
+});
+
+test('new native mentions wake immediately; history recovers missed pushes after restart', async () => {
+  const t = setup();
+  t.db.set('owner.json', { uin: '789' });
+  const markers = new Set();
+  const signal = (seq, id) => markers.add(seq + '_' + id);
+  const row = n => ({
+    ...t.message(n), elements: [
+      { elementType: 1, textElement: { atType: 2, atUid: '456', content: '@Mac' } },
+      { elementType: 1, textElement: { atType: 0, content: ' test' } },
+    ],
+  });
+  t.rows[0] = row(1);
+  const g = t.start(signal);
+  await g.initialize();
+  g.receive([t.rows[0], t.message(2)]);
+  assert.equal(markers.size, 0);
+  t.rows.push(row(2));
+  g.receive([t.rows[1],t.rows[1]]);
+  assert.deepEqual([...markers], ['2_2']);
+  assert.equal(g.status().seq, '1');
+  await g.sync();
+  t.rows.push(row(3));
+  const resumed = t.start(signal);
+  await resumed.initialize();
+  await resumed.sync();
+  assert.deepEqual([...markers], ['2_2', '3_3']);
+});
+
+test('one answer per human mention; collaborator mentions and bot output cannot start a conversation', async () => {
+  const t = setup();
+  t.db.set('owner.json', {uin:'789'});
+  const wakes = [];
+  const g = t.start((seq, id) => wakes.push(id));
+  await g.initialize();
+  const at = {elementType:1, textElement:{atType:2, atUid:'456', content:'@Mac'}};
+  const input = {elementType:1, textElement:{atType:0, content:' 试一试'}};
+  const original = {...t.message(2, '19'), elements:[at, input]};
+  const bot = {...t.message(3, '20'), senderUin:'1001', senderUid:'other-bot', elements:[at, input]};
+  t.rows.push(original, bot);
+  g.receive([original, bot]);
+  assert.deepEqual(wakes, ['19']);
+  const args = {id:'19', seq:'2', group:'123', account:'456', owner:'789', text:'@Windows /task win 一句话'};
+  let sent = [];
+  t.service.generateMsgUniqueId = () => '1000';
+  t.service.sendMsg = async (id, peer, elements) => {
+    const echo = {...t.message(4, '21', 'self'), elements, sendStatus:2};
+    sent.push(elements);
+    t.rows.push(echo);
+    g.receive([echo]);
+    return {result:0};
+  };
+  await assert.rejects(g.call('reply_to_mention', {...args,id:'20',seq:'3'}), /verified controller/);
+  await assert.rejects(g.call('reply_to_mention', {...args,owner:'1001'}), /live binding/);
+  const receipt = await g.call('reply_to_mention', args);
+  assert.equal(receipt.state,'observed_in_group');
+  assert.equal(receipt.messageId,'21');
+  assert.deepEqual(await g.call('reply_to_mention',args),receipt);
+  assert.equal(sent.length,1);
+  assert.equal(sent[0].length,1);
+  assert.equal(sent[0][0].textElement.atType,0);
+  assert.equal(sent[0][0].textElement.content,'回复 #2\n'+args.text);
+  assert.deepEqual(wakes,['19']);
 });

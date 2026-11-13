@@ -77,7 +77,7 @@ function syntheticQQ() {
         const deliver=()=>{
           push(text);
           // Fresh QQ message ID and repeated wire event: exercises both levels of deduplication.
-          if (frame.type==='request') push(text);
+          if (['request','brief','contribution'].includes(frame.type)) push(text);
         };
         const hold=held.get(frame.type);
         if(hold){held.delete(frame.type);hold(deliver);}
@@ -413,3 +413,43 @@ test('opt-in paid model rehearsal revises GO to HOLD through both services and s
     events:types,queueToPeerAckMs:owner.ownerQueueToPeerAckMs,queueToReviewMs:owner.ownerQueueToReviewMs,
     queueToBothCompleteMs:owner.ownerQueueToCloseMs,matchingFinalSHA256:owner.finalSha256}));
 });
+
+
+for (const real of [false,true]) {
+  test((real?'opt-in real Codex':'offline')+' co-writing joins two private observations into a new conclusion',
+    {skip:real && process.env.QQ_COLLAB_REAL_MODEL!=='1',timeout:280000},async t=>{
+      const {qa,qb,network}=await setup(t,real);
+      const first=mcpClient(qa.state),second=mcpClient(qb.state);
+      t.after(()=>Promise.all([first.close(),second.close()]));
+      const task='合写一份简短的串行耗时说明。两个平台各负责一个阶段，仅有本端数据。首段给第一阶段耗时并把第二阶段交给对端。结尾计算总计及相对 300 ms 预算的余量或超额。用阿拉伯数字。';
+      for (const [owner,peer] of real?[[first,second]]:[[first,second],[second,first]]) {
+        const corrected=!real && owner===second;
+        const input={task:task+(corrected?'演练退修':''),request_id:randomUUID()};
+        const {id}=await owner.tool('collab_write',input);
+        assert.equal((await owner.tool('collab_write',input)).id,id);
+        let a;
+        do { a=await owner.tool('collab_wait',{id,timeout_ms:25000}); }
+        while (!['complete','failed','expired'].includes(a.phase));
+        assert.equal(a.phase,'complete',JSON.stringify(a.events));
+        const b=await peer.tool('collab_status',{id});
+        assert.deepEqual(a.writing,b.writing);
+        assert.deepEqual(a.final,b.final);
+        assert.equal(a.peerReceipt.finalSha256,b.finalReceipt.finalSha256);
+        const {lead,contribution:{passage,evidence}}=a.writing;
+        assert.ok(passage.includes(evidence));
+        const conclusion=a.final.answer.split('\n\n').at(-1);
+        assert.match(a.final.answer,/80/);assert.match(a.final.answer,/240/);
+        assert.match(conclusion,/320/);assert.match(conclusion,/(?:^|[^0-9])20(?:[^0-9]|$)/);
+        assert.doesNotMatch(lead,/320/);
+        assert.equal(a.finalReceipt.revision,corrected?2:1);
+        if(corrected){
+          assert.match(a.writing.revisions[0].answer,/合计 0 ms/);
+          assert.match(a.writing.revisions[0].corrections[0],/修正/);
+          assert.deepEqual(a.writing.revisions[1].corrections,[]);
+        }
+        for(const type of ['brief','received','contribution','final','closed'])
+          assert.equal(network.frames.filter(f=>f.id===id && f.type===type).length,(corrected && type==='final')?2:1,type);
+        if(real)t.diagnostic('实际终稿：'+a.final.answer);
+      }
+    });
+}

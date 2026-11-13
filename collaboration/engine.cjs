@@ -2,6 +2,7 @@
 const {randomUUID, createHash} = require('node:crypto');
 const {DatabaseSync} = require('node:sqlite');
 
+const {writingLimits} = require('./writing.cjs');
 const PREFIX = 'QQCOLLAB/1\n';
 const TTL = 24 * 60 * 60 * 1000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -14,9 +15,11 @@ function validRequestKey(key){
   if(typeof key!=='string'||!/^[A-Za-z0-9_-]{1,80}$/.test(key))throw Error('Invalid request_id');
   return key;
 }
-const stages = {draft_needed:'drafting', review_needed:'reviewing', revision_needed:'revising'};
+const stages = {draft_needed:'drafting', review_needed:'reviewing', revision_needed:'revising',check_needed:'checking'};
 const active = s => !['complete','failed','expired'].includes(s);
 const fields = {
+  brief:{task:600,lead:writingLimits.lead,assignment:writingLimits.assignment},
+  contribution:{passage:writingLimits.passage,evidence:writingLimits.evidence},
   request:{task:600,draft:1000,question:350}, received:{}, review:{finding:650,evidence:650,suggestion:650},
   final:{answer:1500,disposition:100,rationale:600}, closed:{}, amend:{}, note:{text:350}, failed:{reason:160}
 };
@@ -88,6 +91,8 @@ class Engine {
           state TEXT,tries INTEGER DEFAULT 0,next_try INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS job_events ON events(job_id,dir,type);
         CREATE INDEX IF NOT EXISTS pending_mail ON events(dir,state,next_try);`);
+      if (!db.prepare('PRAGMA table_info(jobs)').all().some(c=>c.name==='mode'))
+        db.exec("ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'review'");
       db.prepare('INSERT OR IGNORE INTO binding(slot,self,peer) VALUES(1,?,?)').run(self,peer);
       const pair=db.prepare('SELECT self,peer FROM binding WHERE slot=1').get();
       if(pair.self!==self||pair.peer!==peer) throw Error('This state directory belongs to another pair');
@@ -126,20 +131,21 @@ class Engine {
     const data=JSON.parse(row.data);
     return {event:row.event,revision:data.revision??1,noteIds:data.noteIds??[],finalSha256:finalHash(JSON.stringify(finalText(data)))};
   }
-  start(input, auto=false){
+  start(input, auto=false, mode='review'){
     const key=Object.hasOwn(input,'request_id')?validRequestKey(input.request_id):undefined;
     const id=input.id??(key===undefined?randomUUID():stableEvent('round',this.self,this.peer,key));
     if(typeof id!=='string'||!UUID.test(id)) throw Error('Expected a UUIDv4 collaboration ID');
-    const data=auto ? {task:payload('request',{task:input.task,draft:'-',question:'-'}).task} :
+    const writing=mode==='write';
+    const data=writing && !auto ? payload('brief',{task:input.task,lead:input.lead,assignment:input.assignment}) : auto ? {task:payload('request',{task:input.task,draft:'-',question:'-'}).task} :
       payload('request',{task:input.task,draft:input.draft,question:input.question});
-    const hash=createHash('sha256').update(JSON.stringify(data)).digest('hex');
+    const hash=createHash('sha256').update(JSON.stringify(writing ? {mode,data} : data)).digest('hex');
     return this.txn(()=>{
       const old=this.row(id);
       if(old){if(old.role!=='owner'||old.source_hash!==hash) throw Error('Collaboration ID already in use'); return id;}
       const at=this.clock();
-      this.db.prepare("INSERT INTO jobs(id,role,phase,created,updated,task,draft,question,source_hash) VALUES(?,'owner',?,?,?,?,?,?,?)")
-        .run(id,auto?'draft_needed':'awaiting_review',at,at,data.task,data.draft??null,data.question??null,hash);
-      if(!auto)this.emit(id,'request',data);
+      this.db.prepare("INSERT INTO jobs(id,role,phase,created,updated,task,draft,question,source_hash,mode) VALUES(?,'owner',?,?,?,?,?,?,?,?)")
+        .run(id,auto?'draft_needed':'awaiting_review',at,at,data.task,data.draft??data.lead??null,data.question??data.assignment??null,hash,mode);
+      if(!auto)this.emit(id,writing?'brief':'request',data);
       return id;
     });
   }
@@ -172,7 +178,9 @@ class Engine {
   }
   canRecord(m){
     const job=this.row(m.id);
-    if(!job && m.type!=='request' && m.type!=='note')return false;
+    if(!job && !['brief','request','note'].includes(m.type))return false;
+    if(job && (m.type==='contribution' || m.type==='review') &&
+       (job.role!=='owner' || job.phase!=='awaiting_review' || (m.type==='contribution')!==(job.mode==='write')))return false;
     if(job && !active(job.phase)){
       // The owner can reference a note in a final before QQ delivers the original
       // note to the reviewer. Retain its wording later without reopening a job.
@@ -184,8 +192,11 @@ class Engine {
       if(job.role!=='owner' || job.phase!=='awaiting_close')return false;
       const current=this.latestFinal(m.id,'out');
       if(current?.event!==m.data.finalEvent)return false;
-      if(m.type==='closed')return !m.receipt || (m.receipt.revision===current.revision &&
-        m.receipt.finalSha256===current.finalSha256 && typeof job.final==='string' && m.receipt.finalSha256===finalHash(job.final));
+      if(m.type==='closed'){
+        if(!m.receipt)return job.mode==='review'; // Legacy review peers sent only the event ID.
+        return m.receipt.revision===current.revision && m.receipt.finalSha256===current.finalSha256 &&
+          typeof job.final==='string' && m.receipt.finalSha256===finalHash(job.final);
+      }
       if(current.revision>=3 || m.data.notes.some(n=>current.noteIds.includes(n.id) || n.id===m.event))return false;
       const inbound=this.db.prepare("SELECT count(*) n FROM events WHERE job_id=? AND dir='in' AND type='note'").get(m.id).n;
       let extra=0;
@@ -215,34 +226,25 @@ class Engine {
   }
   applyWaiting(id){
     // A QQ update may arrive before the request it refers to. Commit the whole batch with its receive cursor.
-    const waiting=this.db.prepare("SELECT event,type,data,at FROM events WHERE job_id=? AND dir='in' AND state='waiting' ORDER BY CASE type WHEN 'request' THEN 0 ELSE 1 END,rowid").all(id);
+    const waiting=this.db.prepare("SELECT event,type,data,at FROM events WHERE job_id=? AND dir='in' AND state='waiting' ORDER BY CASE WHEN type IN ('request','brief') THEN 0 ELSE 1 END,rowid").all(id);
     for(const msg of waiting){
       const d=JSON.parse(msg.data),job=this.row(id),now=this.clock();
       let state='applied';
-      if(!job && msg.type!=='request') continue;
-      if(msg.type==='request' && !job){
-        this.db.prepare("INSERT INTO jobs(id,role,phase,created,updated,task,draft,question) VALUES(?,'reviewer','review_needed',?,?,?,?,?)")
-          .run(id,now,now,d.task,d.draft,d.question);
+      const opening=msg.type==='request' || msg.type==='brief';
+      if(!job && !opening) continue;
+      if(opening && !job){
+        this.db.prepare("INSERT INTO jobs(id,role,phase,created,updated,task,draft,question,mode) VALUES(?,'reviewer','review_needed',?,?,?,?,?,?)")
+          .run(id,now,now,d.task,d.draft??d.lead,d.question??d.assignment,msg.type==='brief'?'write':'review');
         this.emit(id,'received',{});
       } else if(!active(job.phase) && msg.type!=='note')state='ignored';
       else if(msg.type==='received' && job.role==='owner'){
         this.db.prepare('UPDATE jobs SET peer_received=coalesce(peer_received,?) WHERE id=?').run(now,id);
-      } else if(msg.type==='review' && job.role==='owner' && job.phase==='awaiting_review'){
+      } else if((msg.type==='review'||msg.type==='contribution') && job.role==='owner' && job.phase==='awaiting_review'){
         this.db.prepare('UPDATE jobs SET review=?,peer_received=coalesce(peer_received,?) WHERE id=?').run(msg.data,now,id);
         this.setPhase(id,'revision_needed');
       } else if(msg.type==='final' && job.role==='reviewer' && job.phase==='awaiting_final'){
-        const ownNotes=this.db.prepare("SELECT event,data FROM events WHERE job_id=? AND type='note' AND dir='out' ORDER BY rowid").all(id);
-        const missing=ownNotes.filter(n=>!d.noteIds.includes(n.event)).map(n=>({id:n.event,text:JSON.parse(n.data).text}));
         this.db.prepare('UPDATE jobs SET final=? WHERE id=?').run(JSON.stringify(finalText(d)),id);
-        if(missing.length){
-          this.emit(id,'amend',{finalEvent:msg.event,notes:missing});
-        }else{
-          this.setPhase(id,'complete');
-          const saved=this.row(id).final;
-          this.emit(id,'closed',{finalEvent:msg.event},randomUUID(),{
-            revision:d.revision,platform:process.platform,finalSha256:finalHash(saved)
-          });
-        }
+        this.settleFinal(id,msg.event,d,job.mode==='write'?'required':null);
       } else if(msg.type==='closed' && job.role==='owner' && job.phase==='awaiting_close'){
         this.setPhase(id,'complete');
       } else if(msg.type==='amend'){
@@ -263,6 +265,36 @@ class Engine {
       this.db.prepare('UPDATE events SET state=? WHERE event=?').run(state,msg.event);
     }
   }
+  settleFinal(id,event,{revision,noteIds},check){
+    const own=this.db.prepare("SELECT event,data FROM events WHERE job_id=? AND type='note' AND dir='out' ORDER BY rowid").all(id);
+    const missing=own.filter(n=>!noteIds.includes(n.event)).map(n=>({id:n.event,text:JSON.parse(n.data).text}));
+    // Apply any outstanding note before judging a manuscript that does not include it.
+    if(!missing.length && check==='required'){
+      this.setPhase(id,'check_needed');
+      return;
+    }
+    if(!missing.length && check?.verdict==='revise'){
+      if(revision>=3 || own.length>=2){
+        const reason='合稿仍有分歧：'+check.reason.slice(0,145);
+        this.db.prepare('UPDATE jobs SET reason=? WHERE id=?').run(reason,id);
+        this.setPhase(id,'failed');
+        this.emit(id,'failed',{reason});
+        return;
+      }
+      const noteId=randomUUID();
+      this.emit(id,'note',{text:check.reason},noteId);
+      missing.push({id:noteId,text:check.reason});
+    }
+    if(missing.length){
+      this.emit(id,'amend',{finalEvent:event,notes:missing});
+      this.setPhase(id,'awaiting_final');
+    } else {
+      this.emit(id,'closed',{finalEvent:event},randomUUID(),{
+        revision,platform:process.platform,finalSha256:finalHash(this.row(id).final)
+      });
+      this.setPhase(id,'complete');
+    }
+  }
   recover(){
     this.txn(()=>{
       for(const [ready,running] of Object.entries(stages))this.db.prepare('UPDATE jobs SET phase=? WHERE phase=?').run(ready,running);
@@ -271,23 +303,30 @@ class Engine {
   }
   claim(){
     return this.txn(()=>{
-      const job=this.db.prepare("SELECT * FROM jobs WHERE phase IN ('draft_needed','review_needed','revision_needed') ORDER BY updated,id LIMIT 1").get();
+      const job=this.db.prepare("SELECT * FROM jobs WHERE phase IN ('draft_needed','review_needed','revision_needed','check_needed') ORDER BY updated,id LIMIT 1").get();
       if(!job)return null;
       const phase=stages[job.phase];this.setPhase(job.id,phase);
-      return {id:job.id,phase,task:job.task,draft:job.draft,question:job.question,
-        review:job.review?JSON.parse(job.review):null,...this.noteSnapshot(job.id)};
+      return {id:job.id,phase,mode:job.mode,task:job.task,draft:job.draft,question:job.question,
+        review:job.review?JSON.parse(job.review):null,final:job.final?JSON.parse(job.final):null,...this.noteSnapshot(job.id)};
     });
   }
   finish(job,result){
     return this.txn(()=>{
       if(this.row(job.id)?.phase!==job.phase)return;
       if(job.phase==='drafting'){
+        if(job.mode==='write'){
+          this.emit(job.id,'brief',{task:job.task,lead:result.lead,assignment:result.assignment});
+          this.db.prepare('UPDATE jobs SET draft=?,question=? WHERE id=?').run(result.lead,result.assignment,job.id);
+          this.setPhase(job.id,'awaiting_review');
+          return;
+        }
         const request=payload('request',{task:job.task,draft:result.draft,question:result.question});
         this.emit(job.id,'request',request);
         this.db.prepare('UPDATE jobs SET draft=?,question=? WHERE id=?').run(request.draft,request.question,job.id);
         this.setPhase(job.id,'awaiting_review');
       } else if(job.phase==='reviewing'){
-        const review=payload('review',result);this.emit(job.id,'review',review);
+        const type=job.mode==='write'?'contribution':'review';
+        const review=payload(type,result);this.emit(job.id,type,review);
         this.db.prepare('UPDATE jobs SET review=? WHERE id=?').run(JSON.stringify(review),job.id);
         this.setPhase(job.id,'awaiting_final');
       } else if(job.phase==='revising'){
@@ -300,6 +339,10 @@ class Engine {
         this.emit(job.id,'final',{...result,revision,noteIds});
         this.db.prepare('UPDATE jobs SET final=? WHERE id=?').run(JSON.stringify(finalText(result)),job.id);
         this.setPhase(job.id,'awaiting_close');
+      } else if(job.phase==='checking'){
+        const last=this.latestFinal(job.id,'in');
+        if(!['accept','revise'].includes(result.verdict))throw Error('Unknown co-author verdict');
+        this.settleFinal(job.id,last.event,last,result);
       } else throw Error('Unexpected work phase');
     });
   }
@@ -340,14 +383,27 @@ class Engine {
       this.db.prepare("DELETE FROM events WHERE dir='in' AND state='waiting' AND at<?").run(now-TTL);
     });
   }
+  writingRevisions(id,role){
+    const dir=role==='owner'?'out':'in';
+    const finals=this.db.prepare("SELECT event,data FROM events WHERE job_id=? AND dir=? AND type='final' AND (dir='out' OR state='applied') ORDER BY rowid").all(id,dir);
+    const feedback=this.db.prepare("SELECT data FROM events WHERE job_id=? AND dir<>? AND type='amend' AND (dir='out' OR state='applied')").all(id,dir)
+      .map(row=>JSON.parse(row.data));
+    return finals.map(row=>{
+      const {revision,answer}=JSON.parse(row.data);
+      return {revision,answer,corrections:feedback.find(f=>f.finalEvent===row.event)?.notes.map(n=>n.text)??[]};
+    });
+  }
   status(id){
-    if(!id)return this.db.prepare('SELECT id,role,phase,created,updated FROM jobs ORDER BY created DESC LIMIT 30').all();
+    if(!id)return this.db.prepare('SELECT id,role,mode,phase,created,updated FROM jobs ORDER BY created DESC LIMIT 30').all();
     const j=this.row(id);if(!j)throw Error('Unknown collaboration ID');
     const events=this.db.prepare('SELECT dir,type,state,at,observed FROM events WHERE job_id=? ORDER BY rowid').all(id);
     const close=j.role==='owner' && j.phase==='complete' && this.db.prepare(
       "SELECT data,receipt FROM events WHERE job_id=? AND dir='in' AND type='closed' AND state='applied' AND receipt IS NOT NULL"
     ).get(id);
-    return {id,role:j.role,phase:j.phase,task:j.task,draft:j.draft,question:j.question,review:j.review?JSON.parse(j.review):null,
+    const writing=j.mode==='write';
+    const contribution=j.review?JSON.parse(j.review):null;
+    return {id,role:j.role,mode:j.mode,phase:j.phase,
+      ...(writing?{writing:{lead:j.draft,assignment:j.question,contribution,revisions:this.writingRevisions(id,j.role)}}:{}),task:j.task,draft:j.draft,question:j.question,review:writing?null:contribution,
       finalReceipt:this.latestFinal(id,j.role==='owner'?'out':'in'),
       peerReceipt:close?{finalEvent:JSON.parse(close.data).finalEvent,...JSON.parse(close.receipt)}:null,
       final:j.final?JSON.parse(j.final):null,reason:j.reason,peerReceivedAt:j.peer_received,notes:this.loggedNotes(id),events};

@@ -8,12 +8,15 @@ const base = '/Applications/QQ.app/Contents/Resources/app/';
 const account = { uid: 'u_' + self, uin: self };
 let loginCallbacks, sessionCallbacks;
 const dmRows = [];
-let dmListener;
+const groupRows = [{chatType:2,peerUid:'900',peerUin:'900',senderUin:'400',senderUid:'u_400',
+  msgTime:'1000',msgSeq:'1',msgId:'10001',elements:[{elementType:1,textElement:{atType:0,content:'fixture '+self}}]}];
+const listeners = new Set();
 if (process.send) {
   process.on('message', command => {
     if (command?.op !== 'fixture-push') return;
-    dmRows.push(command.row);
-    dmListener?.onRecvMsg([command.row]);
+    const rows=command.row.chatType===2?groupRows:dmRows;
+    if (!rows.some(row=>row.msgId===command.row.msgId)) rows.push(command.row);
+    for (const listener of listeners) listener.onRecvMsg([command.row]);
     process.send({op:'fixture-pushed'});
   });
 }
@@ -35,6 +38,7 @@ const login = {
   getMsfStatus: () => 3,
 };
 const session = {
+  getMSFService:()=>({getServerTime:()=>1000}),
   init(config, ignored1, ignored2, callbacks) { sessionCallbacks = callbacks; },
   startNT() { setImmediate(() => sessionCallbacks.onOpentelemetryInit({ is_init: true })); },
   getGroupService: () => ({
@@ -46,10 +50,11 @@ const session = {
     getUidByUin: (_, [uin]) => new Map([[uin, 'u_' + uin]]),
   }),
   getMsgService: () => ({
-    addKernelMsgListener(callbacks) { dmListener=callbacks;return 7; },
-    removeKernelMsgListener() { dmListener=undefined; },
+    addKernelMsgListener(callbacks) { listeners.add(callbacks);return callbacks; },
+    removeKernelMsgListener(listener) { listeners.delete(listener); },
     getAioFirstViewLatestMsgs(peer,count) {
       const group = peer.chatType === 2;
+      if (group) return {result:0,msgList:groupRows.slice(-count)};
       if (!group && count>1) return {result:0,msgList:dmRows.slice(-count)};
       const peerUin = group ? '900' : peer.peerUid.slice(2);
       return { result: 0, msgList: [{
@@ -58,8 +63,15 @@ const session = {
         elements: [{ elementType: 1, textElement: { atType: 0, content: 'fixture ' + self } }],
       }] };
     },
+    getMsgsBySeqAndCount(_,start,count) {
+      return {result:0,msgList:groupRows.filter(row=>Number(row.msgSeq)>=Number(start)).slice(0,count)};
+    },
+    generateMsgUniqueId:()=> '321',
     sendMsg(_, peer, elements) {
-      assert.equal(peer.chatType, 1);
+      if (peer.chatType===2) {
+        const seq=String(Number(groupRows.at(-1).msgSeq)+1);
+        groupRows.push({...peer,peerUin:'900',senderUid:account.uid,senderUin:self,msgTime:'1000',msgSeq:seq,msgId:seq,elements,sendStatus:2});
+      }
       appendFileSync('test-sends.jsonl', JSON.stringify({ from: self, to: peer.peerUid,
         text: elements[0].textElement.content }) + '\n');
       return { result: 0 };

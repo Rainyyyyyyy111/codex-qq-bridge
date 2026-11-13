@@ -1,0 +1,38 @@
+#!/bin/zsh
+set -eu
+umask 077
+code=${0:A:h}
+if [[ -z ${QQ_BRIDGE_PROFILE:-} ]]; then exec "$code/bridge" "mention-${1:-enable}"; fi
+runtime=$QQ_BRIDGE_RUNTIME
+state=$QQ_BRIDGE_STATE
+label=local.codex.qq-mention
+[[ $QQ_BRIDGE_PROFILE == default ]] || label="$label-$QQ_BRIDGE_PROFILE"
+[[ -f "$runtime/mention_dispatch.py" ]] || { print -u2 'Install this version of the profile first'; exit 1; }
+plist="$HOME/Library/LaunchAgents/$label.plist"
+domain="gui/$(id -u)"
+if [[ ${1:-enable} == disable ]]; then
+  : > "$state/mention-paused"
+  if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then /bin/launchctl bootout "$domain/$label"; fi
+  rm -f "$plist"
+  exit 0
+fi
+"$runtime/bridge" --profile "$QQ_BRIDGE_PROFILE" trigger arm >/dev/null
+mkdir -p "$state/mention-wake" "${plist:h}"
+/usr/bin/python3 - "$plist" "$runtime" "$state" "$label" <<'PY'
+import os, plistlib, sys
+from pathlib import Path
+plist, runtime, state, label = sys.argv[1:]
+config = dict(Label=label, ProgramArguments=['/usr/bin/python3', str(Path(runtime)/'mention_dispatch.py')],
+              QueueDirectories=[str(Path(state)/'mention-wake')], ThrottleInterval=5,
+              EnvironmentVariables={'PATH':os.environ['PATH'], 'QQ_BRIDGE_STATE':state, 'QQ_BRIDGE_ROUTE':os.environ['QQ_BRIDGE_ROUTE'], 'QQ_BRIDGE_PROFILE':os.environ['QQ_BRIDGE_PROFILE']},
+              StandardOutPath=str(Path(state)/'mention.log'), StandardErrorPath=str(Path(state)/'mention.log'))
+dest = Path(plist)
+data = plistlib.dumps(config)
+if not dest.exists() or dest.read_bytes() != data:
+    tmp = dest.with_suffix('.new')
+    tmp.write_bytes(data)
+    tmp.replace(dest)
+PY
+if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then /bin/launchctl bootout "$domain/$label"; fi
+rm -f "$state/mention-paused"
+/bin/launchctl bootstrap "$domain" "$plist"

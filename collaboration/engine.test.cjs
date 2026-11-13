@@ -240,3 +240,48 @@ test('missing ids are optional only when omitted and explicit invalid idempotenc
   }
   assert.equal(A.status().length,1);assert.deepEqual(A.status(id).notes,[]);
 });
+
+test('co-author checks recover after restart and unresolved editorial disagreement stays open until the correction budget is exhausted',t=>{
+  const p=pair(t),a=p.sides.A;
+  const input={request_id:'coauthor-restart',task:'Decide on a rollout',lead:'Windows is ready.',assignment:'Document the Mac gate.'};
+  const id=a.start(input,false,'write');
+  assert.throws(()=>a.start({...input,draft:'Windows is ready.',question:'Document the Mac gate.'}),/already in use/);
+  p.relay('A','B');p.relay('B','A');
+  p.sides.B.finish(p.sides.B.claim(),{passage:'Mac needs more testing.',evidence:'more testing'});
+  p.relay('B','A');
+  for(let r=1;r<=3;r++){
+    a.finish(a.claim(),{...final,answer:'Candidate '+r});
+    p.relay('A','B');
+    assert.equal(p.sides.B.claim().phase,'checking');
+    p.restart('B');
+    const b=p.sides.B,job=b.claim();
+    assert.equal(job.phase,'checking');assert.equal(job.final.answer,'Candidate '+r);
+    b.finish(job,{verdict:'revise',reason:'Restore the Mac gate, version '+r});
+    if(r<3){
+      assert.equal(p.relay('B','A').type,'note');
+      assert.equal(p.relay('B','A').type,'amend');
+    }else assert.equal(p.relay('B','A').type,'failed');
+  }
+  for(const endpoint of [a,p.sides.B]){
+    const s=endpoint.status(id);
+    assert.equal(s.phase,'failed');assert.match(s.reason,/version 3/);
+    assert.equal(s.writing.revisions.length,3);assert.equal(s.peerReceipt,null);
+    assert.equal(endpoint.claim(),null);assert.equal(endpoint.takeMail(),null);
+  }
+});
+
+test('an in-flight co-written final is amended before proofreading against two previously sent corrections',t=>{
+  const p=pair(t),{A,B}=p.sides;
+  const id=A.start({task:'Write a release note',lead:'Windows is ready.',assignment:'Add Mac.'},false,'write');
+  p.relay('A','B');p.relay('B','A');
+  B.finish(B.claim(),{passage:'Mac needs testing.',evidence:'testing'});p.relay('B','A');
+  A.finish(A.claim(),final);
+  B.note(id,'First correction','one');B.note(id,'Second correction','two');
+  p.relay('A','B');
+  assert.equal(B.claim(),null);assert.equal(B.status(id).phase,'awaiting_final');
+  for(const type of ['note','note','amend'])assert.equal(p.relay('B','A').type,type);
+  A.finish(A.claim(),final);p.relay('A','B');
+  const check=B.claim();assert.equal(check.phase,'checking');
+  B.finish(check,{verdict:'accept',reason:'Corrected.'});p.relay('B','A');
+  assert.equal(A.status(id).phase,'complete');assert.equal(A.status(id).finalReceipt.revision,2);
+});

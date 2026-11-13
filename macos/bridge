@@ -57,7 +57,9 @@ case "$action" in
     action=${1:-status}
     (( $# == 0 )) || shift
     exec "${QQ_BRIDGE_NODE:-node}" "$shared/service.cjs" "$action" --state "$QQ_BRIDGE_COLLAB_STATE" --bridge-dir "$QQ_BRIDGE_STATE" --socket bridge.sock "$@" ;;
+  mention-enable) exec "$code/install-mention" enable ;;
+  mention-disable) exec "$code/install-mention" disable ;;
   trigger) exec /usr/bin/python3 "$code/triggerctl.py" "$@" ;;
-  *) print -u2 'Usage: ./bridge [--profile NAME] paths|probe|install|status|mcp|serve|choose GROUP|trigger ACTION|collab ACTION'
+  *) print -u2 'Usage: ./bridge [--profile NAME] paths|probe|install|status|mcp|serve|choose GROUP|mention-enable|mention-disable|trigger ACTION|collab ACTION'
      exit 2 ;;
 esac

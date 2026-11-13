@@ -141,12 +141,19 @@ async function startRead() {
     fs.mkdirSync(path.join(root, 'dm-outbox'), { recursive: true, mode: 0o700 });
     direct = require('./direct.cjs').createDirect(session, binding, settings, readJSON, writeJSON);
   }
-  group = require('./group.cjs').createGroup(session, binding, readJSON, writeJSON);
-  let lastError;
+  const wake = path.join(root, 'mention-wake');
+  group = require('./group.cjs').createGroup(session, binding, readJSON, writeJSON, (seq, id) => {
+    fs.closeSync(fs.openSync(path.join(wake, seq + '_' + id), 'a', 0o600));
+  }, {mentionsEnabled: () => fs.existsSync(wake) && !fs.existsSync(path.join(root, 'mention-paused'))});
+  let lastError, listening = false;
   for (const delay of [0, 1000, 2000, 4000, 8000, 15000]) {
     if (delay) await new Promise((r) => setTimeout(r, delay));
     try {
       const m = await group.initialize();
+      if (!listening) {
+        session.getMsgService().addKernelMsgListener(callbacks({onRecvMsg:group.receive}));
+        listening = true;
+      }
       await group.sync();
       if (!readJSON('binding.json')) writeJSON('binding.json', binding);
       if (!readJSON('group-pin.json'))

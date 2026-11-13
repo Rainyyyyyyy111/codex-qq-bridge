@@ -389,5 +389,5 @@ async function cli() {
   }
   throw Error('Unknown DM command');
 }
-module.exports={startPairedDm,createAdapter,configurePair,readPair,request,prefix};
+module.exports={listen,privateDir,replace,startPairedDm,createAdapter,configurePair,readPair,request,prefix};
 if (require.main===module) cli().catch(err=>{console.error(err.message);process.exitCode=1;});

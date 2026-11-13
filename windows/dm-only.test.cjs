@@ -35,7 +35,7 @@ test('private-only login starts the peer callback and history without querying a
   }finally{handle.close();}
 });
 
-test('portable installer injects private-only branch before group, filters saved login, and remains idempotent', {skip:process.platform!=='win32'}, t=>{
+test('portable installer injects private-only branch before group, filters saved login, and remains idempotent', {skip:process.platform!=='win32' && !process.env.QQ_TEST_PWSH}, t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'qq-dm-install-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const outs=path.join(root,'outputs');fs.mkdirSync(outs);
@@ -55,7 +55,7 @@ test('portable installer injects private-only branch before group, filters saved
     "if (!$lock.WaitOne(10000)) { throw 'Another monitor operation is in progress' }",
     'try {',"    'old'",'} finally { $lock.Dispose() }'
   ].join('\n'));
-  for(let i=0;i<2;i++)execFileSync('pwsh',['-NoProfile','-File',path.join(__dirname,'install.ps1'),'-WatcherRoot',root],{windowsHide:true,stdio:'pipe'});
+  for(let i=0;i<2;i++)execFileSync(process.env.QQ_TEST_PWSH || 'pwsh',['-NoProfile','-File',path.join(__dirname,'install.ps1'),'-WatcherRoot',root],{windowsHide:true,stdio:'pipe'});
   const code=fs.readFileSync(reader,'utf8');
   assert.ok(code.indexOf('if (dmOnly) {')<code.indexOf("if (process.argv[5] === '--watch')"));
   assert.equal((code.match(/dmOnly\.start\(/g)||[]).length,1);
@@ -63,5 +63,10 @@ test('portable installer injects private-only branch before group, filters saved
   assert.match(code,/String\(uin\) !== dmOnly.accountUin/);
   execFileSync(process.execPath,['--check',reader]);
   assert.match(fs.readFileSync(control,'utf8'),/dm-host\.ps1/);
+  const watcher=fs.readFileSync(path.join(outs,'qq-target-watch.cjs'),'utf8');
+  assert.equal(watcher.split('.startMentions(').length,2);
+  assert.equal(watcher.split('.startPairedDm(').length,2);
+  assert.equal(typeof require(path.join(outs,'group-mentions.cjs')).startMentions,'function');
+  assert.ok(fs.existsSync(path.join(outs,'mention-runtime','mention_dispatch.py')));
   assert.ok(fs.existsSync(path.join(outs,'dm-login.html')));
 });

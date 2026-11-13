@@ -1,4 +1,5 @@
 'use strict';
+const { mentionPrompt } = require('./mention.cjs');
 const protocol = require('./events.cjs');
 const { createHash } = require('node:crypto');
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -8,7 +9,7 @@ const fmt = new Intl.DateTimeFormat('sv-SE', {
   timeStyle: 'medium',
 });
 const { checkedResult, checkArgs, validateText, textElement, previewMessage } = require('./native.cjs');
-function createGroup(session, binding, readJSON, writeJSON) {
+function createGroup(session, binding, readJSON, writeJSON, signalMention = () => {}, { mentionsOnly = false, mentionsEnabled = () => true } = {}) {
   const msgs = session.getMsgService();
   const peer = { chatType: 2, peerUid: binding.id, guildId: '' };
   const seenFile = 'cursor-' + binding.id + '.json';
@@ -23,6 +24,18 @@ function createGroup(session, binding, readJSON, writeJSON) {
   const closedRounds = readJSON('closed-rounds.json') ?? [];
   let activeWait = false;
   let lastPollAt, lastError, activePoll;
+  let since = readJSON('mention-start-' + binding.id + '.json');
+  function promptFor(raw) {
+    const prompt = mentionPrompt(raw, binding, owner);
+    if (prompt === null || !since || BigInt(raw.msgSeq) <= BigInt(since.seq) || !mentionsEnabled()) return null;
+    return readJSON('owner.json')?.uin === owner.uin ? prompt : null;
+  }
+  function signal(raw) {
+    if (promptFor(raw) !== null) signalMention(String(raw.msgSeq), String(raw.msgId));
+  }
+  function receive(rows) {
+    if (Array.isArray(rows)) rows.forEach(signal);
+  }
   function record(m) {
     if (
       m.chatType !== 2 ||
@@ -93,7 +106,8 @@ function createGroup(session, binding, readJSON, writeJSON) {
     let seq = cursor.seq;
     for (const { raw, m } of page) {
       if (BigInt(m.seq) < BigInt(seq)) continue;
-      if (!ids.includes(m.id) && m.fromSelf === false) {
+      signal(raw);
+      if (!mentionsOnly && !ids.includes(m.id) && m.fromSelf === false) {
         const now = Date.now();
         const event = protocol.receive(
           m.elements,
@@ -182,7 +196,7 @@ function createGroup(session, binding, readJSON, writeJSON) {
   }
   // A request ID is reserved durably before entering native code. A repeat may
   // inspect its receipt, but can never submit a second message for the same ID.
-  async function sendText(text, requestId) {
+  async function sendText(text, requestId, mentionReply = false) {
     validateText(text, requestId);
     const key = 'outbox/' + requestId + '.json';
     const digest = createHash('sha256').update(text).digest('hex');
@@ -196,8 +210,8 @@ function createGroup(session, binding, readJSON, writeJSON) {
     // since another client or the watcher may have closed it in the meantime.
     protocol.reserve(text, cursor.events ?? {}, self, requestId, Date.now(), closedRounds);
     const before = (await latestRecord()).m;
-    const tag = msgs.generateMsgUniqueId(2, session.getMSFService().getServerTime());
-    if (!tag || String(tag) === '0') throw Error('Could not generate message correlation ID');
+    const tag = mentionsOnly ? '' : msgs.generateMsgUniqueId(2, session.getMSFService().getServerTime());
+    if (!mentionsOnly && (!tag || String(tag) === '0')) throw Error('Could not generate message correlation ID');
     const receipt = {
       requestId,
       groupCode: binding.id,
@@ -207,7 +221,8 @@ function createGroup(session, binding, readJSON, writeJSON) {
       correlation: String(tag),
     };
     // No await between the second lookup and reservation, even for concurrent calls.
-    if (readJSON(key)) return sendText(text, requestId);
+    if (readJSON(key)) return sendText(text, requestId, mentionReply);
+    if (mentionReply && (!mentionsEnabled() || readJSON('owner.json')?.uin !== owner.uin)) throw Error('Controller binding changed');
     const change = protocol.reserve(
       text,
       cursor.events ?? {},
@@ -235,7 +250,7 @@ function createGroup(session, binding, readJSON, writeJSON) {
         const found = items.find(
           ({ raw, m }) =>
             m.fromSelf &&
-            Number(raw.sendStatus) === 2 &&
+            tag && Number(raw.sendStatus) === 2 &&
             String(raw.guildId) === String(tag) &&
             m.elements.length === 1 &&
             m.elements[0] === text,
@@ -247,7 +262,7 @@ function createGroup(session, binding, readJSON, writeJSON) {
         );
         const observed =
           found ||
-          (requestId.length >= 8 && text.includes(requestId) && echoes.length === 1
+          ((mentionReply || (requestId.length >= 8 && text.includes(requestId))) && echoes.length === 1
             ? echoes[0]
             : undefined);
         if (observed) {
@@ -271,10 +286,15 @@ function createGroup(session, binding, readJSON, writeJSON) {
   return {
     async initialize() {
       const m = (await latestRecord()).m;
+      if (!since) {
+        since = { seq: m.seq };
+        writeJSON('mention-start-' + binding.id + '.json', since);
+      }
       if (!cursor) baseline(m);
       return m;
     },
     sync,
+    receive,
     watch,
     status: () => ({
       lastPollAt,
@@ -283,8 +303,27 @@ function createGroup(session, binding, readJSON, writeJSON) {
       queued: cursor?.pending?.length ?? 0,
     }),
     async call(name, args, alive) {
+      if (name === 'reply_to_mention') {
+        checkArgs(args, ['seq', 'id', 'text', 'group', 'account', 'owner']);
+        if (!owner || args.group !== binding.id || args.account !== self || args.owner !== owner.uin ||
+            typeof args.seq !== 'string' || !/^[1-9]\d*$/.test(args.seq) ||
+            typeof args.id !== 'string' || !/^-?[1-9]\d*$/.test(args.id) ||
+            typeof args.text !== 'string' || !args.text.trim())
+          throw Error('Invalid mention reply or live binding');
+        const seq = BigInt(args.seq);
+        const matches = (await range(seq, seq)).filter(({ m, raw }) =>
+          m.id === args.id && m.priority === 'owner' && promptFor(raw) !== null);
+        if (matches.length !== 1) throw Error('Reply requires a verified controller mention');
+        // Keep the output a single plain text element, even if it contains @ or a command.
+        const prefix = '回复 #' + args.seq + '\n';
+        const suffix = mentionsOnly ? '\n（完整回复见 Windows 上的 Codex 对话）' : '\n（完整回复见 Mac 上的 Codex 对话）';
+        const full = prefix + args.text;
+        const text = full.length <= 4000 ? full :
+          full.slice(0, 4000 - suffix.length).replace(/[\uD800-\uDBFF]$/, '') + suffix;
+        return sendText(text, 'mention-reply-' + args.id, true);
+      }
       if (name === 'trigger_page') {
-        checkArgs(args, ['after']);
+        checkArgs(args, ['after','id']);
         if (!owner) throw Error('Set the controller account before enabling task routing');
         const latest = await latestRecord();
         const end = BigInt(latest.m.seq);
@@ -294,14 +333,15 @@ function createGroup(session, binding, readJSON, writeJSON) {
           throw Error('Invalid history cursor');
         const start = BigInt(args.after) + 1n;
         if (start > end) return result;
-        const page = start === end ? [latest] : await range(start, end);
+        if (args.id !== undefined && !/^-?[1-9]\d*$/.test(args.id)) throw Error('Invalid source message ID');
+        const page = start === end ? [latest] : await range(start, args.id ? start : end);
         if (!page.length) throw Error('Trigger history unavailable; cursor retained');
-        result.rows = page.map(({ raw, m }) => {
+        result.rows = page.filter(({m}) => !args.id || m.id === args.id).map(({ raw, m }) => {
           const e = raw.elements.length === 1 ? raw.elements[0] : null;
           const plain = m.priority === 'owner' && e?.elementType === 1 && e.textElement?.atType === 0
             && typeof e.textElement.content === 'string' && e.textElement.content.length <= 16000;
           return { chatType: 2, peerUid: binding.id, peerUin: binding.id, msgId: m.id, msgSeq: m.seq,
-            senderUin: String(raw.senderUin), elements: plain ? [{ elementType: 1,
+            senderUin: String(raw.senderUin), mentionPrompt: promptFor(raw), elements: plain ? [{ elementType: 1,
               textElement: { atType: 0, content: e.textElement.content } }] : [] };
         });
         return result;

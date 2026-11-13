@@ -27,6 +27,21 @@ node $dm $qqData pair $peer
 
 `dm-status` 在原生好友映射及私聊历史都就绪时显示 `ready`。如果快捷登录需要手机确认，本命令给出 `scan-required` 和本机登录页路径，打开该 HTML 页面并用本机协作账号扫码。二维码只存入当前用户的私有配对目录。再次运行 `dm-start` 可复用正在运行的私聊读取器。要停止这个私聊进程可用 `./outputs/qq-target.ps1 dm-stop`；已有群监听的生命周期由原入口管理。
 
+## 群内点名建聊
+
+群 @ 需要现有 Windows 群监听器和本版 `windows/install.ps1` 提供的群监听钩子，还需可执行的 Python 3.9+ 与 Codex CLI。私聊专用 `dm-start` 只监听私聊。需要同时收群 @ 和配对私聊时，在该账号的现有群监听模式中运行两套适配器。每个账号只运行一个原生读取器。
+
+安装本版适配器后，在启动群监听器之前显式选择本机账号、群号和人类控制者。以下命令使用前文的 `$watcherRoot` 和 `$qqData`。
+
+```powershell
+$mentions = Join-Path $watcherRoot 'outputs/group-mentions.cjs'
+node $mentions $qqData enable <本机协同QQ号> <群号> <控制者QQ号>
+# 用原工作区的正常入口启动或重启群监听器，等待该群的 QQ 历史就绪。
+node $mentions $qqData dispatch
+```
+
+`dispatch` 前台运行，首次启动以此时群序号为起点。控制者从 QQ 成员列表点名本机并附上正文，分发器会复核原群历史，创建持久聊天，再把首轮最终回答发回同群。可用环境变量 `QQ_MENTION_PYTHON`、`QQ_MENTION_CODEX` 指定可执行文件。在另一终端执行 `node $mentions $qqData disable` 可撤销该绑定；重新启用或更换群后重新启动群监听器和分发器。旧端须能提供原生群推送、按序号读取历史及群文本发送。仓库的合成测试覆盖这些接口，Windows 真机群环境仍需确认。
+
 ## 让本机 Codex 接入
 
 从一个终端启动独立的协作服务，另一终端可查询 `health` 或注册 MCP。两台设备应各用自己的协作状态目录。生成、复核、收件和普通群聊分别维护状态。
@@ -45,7 +60,7 @@ node (Join-Path $repo 'collaboration/service.cjs') health --state $state
 codex mcp add qq-collab-win -- node (Join-Path $repo 'collaboration/mcp.cjs') --state $state
 ```
 
-新的 Codex 聊天可用 `collab_start` 发起协作、`collab_note` 补充证据、`collab_wait` 等待进展、`collab_status` 查询结果。需要普通私聊时，`peer_read_latest` 可按需查看配对会话的最新一条，`peer_send_text` 可发送用户明确指定的文字。启动服务时的 `--codex` 可指定 Codex 可执行文件，`--evidence-file` 可指定本机拟用于复核的证据资料。
+新的 Codex 聊天可用 `collab_write` 共写短稿、`collab_start` 发起复核、`collab_note` 补充证据、`collab_wait` 等待进展、`collab_status` 查询结果。需要普通私聊时，`peer_read_latest` 可按需查看配对会话的最新一条，`peer_send_text` 可发送用户明确指定的文字。启动服务时的 `--codex` 可指定 Codex 可执行文件，`--evidence-file` 可指定本机拟用于复核的证据资料。
 
 ## 人工私聊
 

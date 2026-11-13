@@ -2,6 +2,23 @@
 
 在已有 Codex 聊天中，可以请另一台设备检查一个会影响结论的问题。例如，发起端只掌握 Windows 的验收数据，可以把初稿和发布门槛交给 Mac。Mac 立即回执，随后回传具体发现、可引用的证据和修改建议。发起端修订同一份稿件，向 Mac 回传最终版本。Mac 收到最终版本后确认结案。两端都可以发起。
 
+## 配对私聊共写短稿
+
+双方运行此版后，在任一端使用 `collab_write`。例如，请两端合写一个上线说明，Windows 提供第一阶段观测，Mac 提供第二阶段观测，并要求结尾判断两阶段串行运行是否超过预算。普通文字私聊和原有的 `collab_start` 审稿保留原入口。与只支持审稿的旧端配对时使用 `collab_start`。
+
+1. 发起端传 `task` 和 `request_id`。第一作者依据本端材料写首段 `lead`，把具体的缺口和交稿要求写在 `assignment`。已有首段时可直接提供这两个字段。
+2. 第二作者能读到首段和分工，提交可直接入稿的 `passage` 和逐字取自材料的 `evidence`。本端配置的资料文件留在本机，双方交换获准分享的正文和引文。
+3. 第一作者编辑两段，补上综合结论。两位作者各自的原始表述可在 `collab_status` 的 `writing` 中查看。合稿保留双方各一处原文，结尾引用两者推导共同判断。
+4. 第二作者核对完整稿件中的事实、因果、适用范围和中途补充。可以提出具体更正，发起端收到后编辑新版本。每端有两条备注额度，校稿退修占第二作者的一条；同一轮最多三版。分歧仍未解决时双方标记为 `failed` 并保留原因。认可后回传最终事件 ID、版次及正文摘要。双方可以用 `collab_wait` 取得同一版终稿，或查看 `writing.revisions` 对照每版正文及退修意见。
+
+命令行入口为 `node collaboration/service.cjs write --state <本端状态目录>`，从标准输入读取与 MCP 相同的 JSON。例如：
+
+```json
+{"request_id":"serial-budget-01","task":"合写串行耗时判断，与 300 ms 预算比较。","lead":"第一阶段测得 80 ms。","assignment":"只用对端材料补入第二阶段耗时，并注明数据来源。"}
+```
+
+离线集成测试让两端分别持有 80 ms 和 240 ms 数据，检查终稿写出 320 ms 和超预算 20 ms，另故意引入错误以验证退修。用真实 Codex、合成 QQ 重跑可设置 `QQ_COLLAB_REAL_MODEL=1`、`QQ_COLLAB_CODEX` 为支持仓库所用参数的 Codex 可执行文件，再运行 `node --test --test-name-pattern="opt-in real Codex co-writing" collaboration/integration.test.cjs`。
+
 ## 一轮工作如何推进
 
 ```mermaid

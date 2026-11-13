@@ -3,6 +3,7 @@
 import re
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
 ROUTE_NAME = r"(?:mac|win|acct-[a-z][a-z0-9-]{0,23})"
 ROUTE = re.compile(r"/task +(" + ROUTE_NAME + r") +")
@@ -39,7 +40,7 @@ class StalePage(ValueError):
 class TriggerQueue:
     """One private database per bridge account. Bind on local operator enablement."""
 
-    def __init__(self, path, group, owner, account, route, live_account, enabled_after):
+    def __init__(self, path, group, owner, account, route, live_account, enabled_after, *, allow_init=True):
         if (
             not re.fullmatch(ROUTE_NAME, route)
             or account != live_account
@@ -48,7 +49,14 @@ class TriggerQueue:
         ):
             raise ValueError("Invalid local binding or authenticated account")
         self.group, self.owner, self.account, self.route = group, owner, account, route
-        self.db = sqlite3.connect(path, timeout=5, isolation_level=None)
+        uri = Path(path).resolve().as_uri() + ('?mode=rwc' if allow_init else '?mode=rw')
+        self.db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+        if not allow_init and not (
+            self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scope'").fetchone()
+            and self.db.execute("SELECT 1 FROM scope WHERE id=1").fetchone()
+        ):
+            self.db.close()
+            raise ValueError("Task dispatcher requires existing local enablement")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(
             """
@@ -64,14 +72,19 @@ class TriggerQueue:
         with self.transaction():
             if "updated" not in {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}:
                 self.db.execute("ALTER TABLE tasks ADD COLUMN updated INTEGER NOT NULL DEFAULT 0")
-            self.db.execute(
-                "INSERT OR IGNORE INTO scope VALUES(1,?,?,?,?,?,?)",
-                (group, owner, account, route, enabled_after, enabled_after),
-            )
+            if "origin" not in {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}:
+                self.db.execute("ALTER TABLE tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'route'")
+            if "reply_state" not in {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}:
+                self.db.execute("ALTER TABLE tasks ADD COLUMN reply_state TEXT")
+            if allow_init:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO scope VALUES(1,?,?,?,?,?,?)",
+                    (group, owner, account, route, enabled_after, enabled_after),
+                )
             stored = self.db.execute(
-                "SELECT grp,owner,account,route,enabled_after FROM scope"
+                "SELECT grp,owner,account,route,enabled_after FROM scope WHERE id=1"
             ).fetchone()
-            if stored[:4] != (group, owner, account, route):
+            if not stored or stored[:4] != (group, owner, account, route):
                 raise ValueError("Existing database belongs to another binding")
             self.enabled_after = stored[4]
 
@@ -98,6 +111,11 @@ class TriggerQueue:
             raise ValueError("Missing stable QQ identity")
         seq = int(seq)
         if (seq <= self.enabled_after and not replay) or str(m.get("senderUin")) != self.owner:
+            return seq
+        mention = m.get("mentionPrompt")
+        if isinstance(mention, str) and mention.strip() and len(mention.encode("utf-16-le", "surrogatepass")) <= 32000:
+            self.db.execute("INSERT OR IGNORE INTO tasks(grp,msg_id,seq,body,state,origin) VALUES(?,?,?,?,'pending','mention')",
+                            (self.group, msg_id, seq, mention))
             return seq
         elements = m.get("elements")
         if not isinstance(elements, list) or len(elements) != 1:
@@ -131,17 +149,22 @@ class TriggerQueue:
                 cursor = seq
             self.db.execute("UPDATE scope SET cursor=?", (cursor,))
 
-    def claim(self):
+    def claim(self, only_id=None, *, group_reply=False):
+        if group_reply and only_id is None:
+            raise ValueError("A group reply requires a specific mention")
         # The caller is a desktop dispatcher. A second worker can only claim another row.
         with self.transaction():
             row = self.db.execute(
-                "SELECT msg_id,body FROM tasks WHERE state='pending' ORDER BY seq LIMIT 1"
+                "SELECT msg_id,body FROM tasks WHERE state='pending' AND origin=? "
+                "AND (? IS NULL OR msg_id=?) ORDER BY seq LIMIT 1",
+                ("mention" if group_reply else "route", only_id, only_id),
             ).fetchone()
             if row is None:
                 return None
             msg_id, body = row
             self.db.execute(
-                "UPDATE tasks SET state='creating',updated=strftime('%s','now') WHERE grp=? AND msg_id=?", (self.group, msg_id)
+                "UPDATE tasks SET state='creating',reply_state=?,updated=strftime('%s','now') WHERE grp=? AND msg_id=?",
+                ("pending" if group_reply else None, self.group, msg_id),
             )
         title = "QQ-" + self.route.upper() + "-" + msg_id
         return msg_id, {"target": {"type": "projectless"}, "title": title, "prompt": body}
@@ -150,7 +173,7 @@ class TriggerQueue:
         row = self.db.execute(
             """
             SELECT msg_id,state,host,thread_id,client_id,body FROM tasks
-            WHERE state IN ('creating','awaiting','verifying') AND updated < strftime('%s','now')-180
+            WHERE origin='route' AND state IN ('creating','awaiting','verifying') AND updated < strftime('%s','now')-180
             ORDER BY seq LIMIT 1
             """
         ).fetchone()

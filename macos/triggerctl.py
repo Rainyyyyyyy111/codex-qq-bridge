@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,17 +14,30 @@ STATE = Path(os.environ.get("QQ_BRIDGE_STATE", Path.home() / "Library/Applicatio
 ROUTE = os.environ.get("QQ_BRIDGE_ROUTE", "mac")
 
 
-def history(after=None):
-    args = {} if after is None else {"after": str(after)}
+def bridge_call(name, args):
+    adapter = os.environ.get("QQ_MENTION_ADAPTER")
+    if adapter:
+        result = subprocess.run([os.environ["QQ_MENTION_NODE"], adapter, os.environ["QQ_MENTION_DATA"], "rpc", name],
+                                input=json.dumps(args), capture_output=True, encoding="utf-8", timeout=40)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Group listener unavailable")
+        return json.loads(result.stdout)
     with socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(30)
         sock.connect("bridge.sock")
-        sock.sendall(json.dumps({"name": "trigger_page", "args": args}).encode() + b"\n")
+        sock.sendall(json.dumps({"name": name, "args": args}, ensure_ascii=False).encode() + b"\n")
         with sock.makefile("rb") as stream:
             reply = json.load(stream)
     if "error" in reply:
         raise RuntimeError(reply["error"])
     return reply["value"]
+
+
+def history(after=None, source_id=None):
+    args = {} if after is None else {"after": str(after)}
+    if source_id is not None:
+        args["id"] = source_id
+    return bridge_call("trigger_page", args)
 
 
 def check_scope(page, queue):
@@ -37,7 +51,7 @@ def run(args):
     if args.action != "arm" and not path.is_file():
         raise ValueError("Task dispatcher requires local enablement (arm)")
     q = TriggerQueue(path, live["group"], live["owner"], live["account"], ROUTE,
-                     live["account"], int(live["top"]))
+                     live["account"], int(live["top"]), allow_init=args.action == "arm")
     try:
         cursor = q.db.execute("SELECT cursor FROM scope").fetchone()[0]
         if args.action == "replay":
@@ -73,10 +87,10 @@ def run(args):
         if args.action == "verified":
             evidence = json.load(sys.stdin)
             q.verified(args.msg_id, evidence["hostId"], evidence["threadId"], evidence["firstPrompt"])
-        rows = q.db.execute("SELECT msg_id,seq,state,host,thread_id,client_id FROM tasks ORDER BY seq DESC LIMIT 25")
+        rows = q.db.execute("SELECT msg_id,seq,state,host,thread_id,client_id,origin,reply_state FROM tasks ORDER BY seq DESC LIMIT 25")
         return {"group": q.group, "account": q.account, "owner": q.owner, "armedAfter": q.enabled_after,
                 "cursor": cursor, "top": live["top"], "recent": [dict(zip(
-                    ("msgId", "seq", "state", "hostId", "threadId", "clientThreadId"), row)) for row in rows]}
+                    ("msgId", "seq", "state", "hostId", "threadId", "clientThreadId", "origin", "replyState"), row)) for row in rows]}
     finally:
         q.db.close()
 
