@@ -94,7 +94,7 @@ for(const route of ['mac','win']) {
     const replies=messages();
     assert.equal(replies.length,1,errors);assert.equal(replies[0].to,'900');
     assert.equal(replies[0].text,'回复 #4\n已完成：'+prompt);
-    assert.equal(fs.readFileSync(log,'utf8'),'created\n');
+    assert.equal(fs.readFileSync(log,'utf8'),'created'+os.EOL);
     assert.deepEqual(fs.readdirSync(path.join(state,'mention-wake')),[]);
     if(route==='win'){
       execFileSync(process.execPath,[adapter,root,'disable'],{env});
